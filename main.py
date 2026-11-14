@@ -186,7 +186,62 @@ class SubmitView(discord.ui.View):
             ephemeral=True
         )
 bot.add_view(SubmitView())
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
+    if not message.guild:
+        return
+
+    key = (message.guild.id, message.author.id)
+    expected_channel = bot.waiting_for_report.get(key)
+
+    if expected_channel is None:
+        return
+
+    if message.channel.id != expected_channel:
+        return
+
+    if not message.attachments:
+        return
+
+    image_attachment = next(
+        (
+            attachment
+            for attachment in message.attachments
+            if attachment.content_type
+            and attachment.content_type.startswith("image/")
+        ),
+        None
+    )
+
+    if image_attachment is None:
+        await message.reply("❌ Пришли именно изображение.")
+        return
+
+    review_channel = discord.utils.get(
+        message.guild.text_channels,
+        name=REVIEW_CHANNEL_NAME
+    )
+
+    if review_channel is None:
+        await message.reply("❌ Не найден канал проверки отчётов.")
+        return
+
+    await review_channel.send(
+        f"📸 **Новый отчёт автофинки**\n"
+        f"Сотрудник: {message.author.mention}\n"
+        f"Рабочий канал: {message.channel.mention}\n"
+        f"Время отправки: {message.created_at.strftime('%d.%m.%Y %H:%M')}",
+        file=await image_attachment.to_file()
+    )
+
+    del bot.waiting_for_report[key]
+
+    await message.reply(
+        "✅ Скриншот отправлен администрации на проверку!"
+    )
 def is_manager(member):
     return any(
         role.name in ("Владелец", "Администратор")
