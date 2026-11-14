@@ -185,6 +185,297 @@ class SubmitView(discord.ui.View):
             "📸 Теперь отправь скриншот автофинки следующим сообщением в этом канале.",
             ephemeral=True
         )
+
+class ApprovalModal(discord.ui.Modal, title="Подтверждение отчёта"):
+    points = discord.ui.TextInput(
+        label="Количество начисляемых баллов",
+        placeholder="Например: 5",
+        required=True,
+        max_length=3
+    )
+
+    def __init__(self, submission_id, business_count):
+        super().__init__()
+        self.submission_id = submission_id
+        self.business_count = business_count
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message(
+                "Недостаточно прав.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            points = int(self.points.value)
+        except ValueError:
+            await interaction.response.send_message(
+                "Введи целое число.",
+                ephemeral=True
+            )
+            return
+
+        if points < 1 or points > self.business_count:
+            await interaction.response.send_message(
+                f"Можно начислить от 1 до {self.business_count} баллов.",
+                ephemeral=True
+            )
+            return
+
+        with get_db() as db:
+            submission = db.execute(
+                """
+                SELECT employee_id, work_date
+                FROM submissions
+                WHERE id = ? AND status = 'pending'
+                """,
+                (self.submission_id,)
+            ).fetchone()
+
+            if not submission:
+                await interaction.response.send_message(
+                    "Заявка уже обработана или не найдена.",
+                    ephemeral=True
+                )
+                return
+
+            employee_id, work_date = submission
+
+            cursor = db.execute(
+                """
+                UPDATE submissions
+                SET status = 'approved',
+                    points = ?,
+                    reviewer_id = ?,
+                    reviewed_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    points,
+                    str(interaction.user.id),
+                    discord.utils.utcnow().isoformat(),
+                    self.submission_id
+                )
+            )
+
+            if cursor.rowcount == 0:
+                await interaction.response.send_message(
+                    "Заявка уже обработана.",
+                    ephemeral=True
+                )
+                return
+
+            db.execute(
+                """
+                INSERT INTO daily_entries
+                (employee_id, work_date, points)
+                VALUES (?, ?, ?)
+                """,
+                (employee_id, work_date, points)
+            )
+
+            db.execute(
+                """
+                INSERT INTO audit_log
+                (action, details, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "REPORT_APPROVED",
+                    f"Submission {self.submission_id}, points {points}",
+                    discord.utils.utcnow().isoformat()
+                )
+            )
+
+        embed = interaction.message.embeds[0]
+        embed.add_field(
+            name="СТАТУС",
+            value=f"ПРИНЯТ • {points} баллов",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=None)
+
+        await interaction.response.send_message(
+            f"Отчёт принят. Начислено баллов: {points}.",
+            ephemeral=True
+        )
+
+
+class RejectionModal(discord.ui.Modal, title="Отклонение отчёта"):
+    reason = discord.ui.TextInput(
+        label="Причина отклонения",
+        placeholder="Укажи, что нужно исправить",
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, submission_id):
+        super().__init__()
+        self.submission_id = submission_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message(
+                "Недостаточно прав.",
+                ephemeral=True
+            )
+            return
+
+        with get_db() as db:
+            cursor = db.execute(
+                """
+                UPDATE submissions
+                SET status = 'rejected',
+                    reviewer_id = ?,
+                    reviewed_at = ?,
+                    rejection_reason = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    str(interaction.user.id),
+                    discord.utils.utcnow().isoformat(),
+                    self.reason.value,
+                    self.submission_id
+                )
+            )
+
+            if cursor.rowcount == 0:
+                await interaction.response.send_message(
+                    "Заявка уже обработана или не найдена.",
+                    ephemeral=True
+                )
+                return
+
+            db.execute(
+                """
+                INSERT INTO audit_log
+                (action, details, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "REPORT_REJECTED",
+                    f"Submission {self.submission_id}: {self.reason.value}",
+                    discord.utils.utcnow().isoformat()
+                )
+            )
+
+        embed = interaction.message.embeds[0]
+        embed.add_field(
+            name="СТАТУС",
+            value=f"ОТКЛОНЁН\nПричина: {self.reason.value}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=None)
+
+        await interaction.response.send_message(
+            "Отчёт отклонён. Сотрудник сможет отправить его повторно.",
+            ephemeral=True
+        )
+
+
+class ReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Принять",
+        style=discord.ButtonStyle.secondary,
+        custom_id="karma:review:approve"
+    )
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message(
+                "Недостаточно прав.",
+                ephemeral=True
+            )
+            return
+
+        with get_db() as db:
+            submission = db.execute(
+                """
+                SELECT id, employee_id
+                FROM submissions
+                WHERE review_message_id = ? AND status = 'pending'
+                """,
+                (str(interaction.message.id),)
+            ).fetchone()
+
+            if not submission:
+                await interaction.response.send_message(
+                    "Заявка не найдена или уже обработана.",
+                    ephemeral=True
+                )
+                return
+
+            business_count = db.execute(
+                """
+                SELECT s.business_count
+                FROM employees e
+                JOIN servers s ON s.name = e.direction
+                WHERE e.id = ?
+                """,
+                (submission[1],)
+            ).fetchone()
+
+        if not business_count or business_count[0] < 1:
+            await interaction.response.send_message(
+                "Сначала настрой количество бизнесов для этого направления.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            ApprovalModal(submission[0], business_count[0])
+        )
+
+    @discord.ui.button(
+        label="Отклонить",
+        style=discord.ButtonStyle.secondary,
+        custom_id="karma:review:reject"
+    )
+    async def reject(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message(
+                "Недостаточно прав.",
+                ephemeral=True
+            )
+            return
+
+        with get_db() as db:
+            submission = db.execute(
+                """
+                SELECT id
+                FROM submissions
+                WHERE review_message_id = ? AND status = 'pending'
+                """,
+                (str(interaction.message.id),)
+            ).fetchone()
+
+        if not submission:
+            await interaction.response.send_message(
+                "Заявка не найдена или уже обработана.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            RejectionModal(submission[0])
+        )
+
+
+bot.add_view(ReviewView())
+
 bot.add_view(SubmitView())
 @bot.event
 async def on_message(message: discord.Message):
