@@ -121,6 +121,7 @@ def init_database():
 
 
 intents = discord.Intents.default()
+intents.message_content = True
 
 
 class KarmaBot(discord.Client):
