@@ -140,6 +140,36 @@ class KarmaBot(discord.Client):
 
 bot = KarmaBot()
 
+REVIEW_CHANNEL_NAME = "проверка-отчётов"
+
+WORK_CHANNELS = {
+    "Mesa": "mesa・работа",
+    "Surprise": "surprise・работа",
+    "Prescott": "prescott・работа",
+    "Faraway": "faraway・работа",
+}
+
+
+class SubmitView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Отправить отчёт",
+        emoji="📸",
+        style=discord.ButtonStyle.primary,
+        custom_id="karma:submit_report"
+    )
+    async def submit_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "📸 Пришли скриншот автофинки следующим сообщением в этом канале.",
+            ephemeral=True
+        )
+
 
 def is_manager(member):
     return any(
