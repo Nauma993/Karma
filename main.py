@@ -79,6 +79,30 @@ def init_database():
         """)
 
         db.execute("""
+            CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER NOT NULL,
+                work_date TEXT NOT NULL,
+                attachment_url TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                points INTEGER NOT NULL DEFAULT 0,
+                review_message_id TEXT,
+                reviewer_id TEXT,
+                reviewed_at TEXT,
+                rejection_reason TEXT,
+                FOREIGN KEY (employee_id) REFERENCES employees(id)
+            )
+        """)
+
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            one_pending_submission_per_employee
+            ON submissions(employee_id)
+            WHERE status = 'pending'
+        """)
+
+        db.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 action TEXT NOT NULL,
