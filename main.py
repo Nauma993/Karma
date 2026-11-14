@@ -531,5 +531,50 @@ async def uninvite(
         view=view,
         ephemeral=True
     )
+@bot.tree.command(
+    name="setup_reports",
+    description="Разместить кнопки отправки отчётов"
+)
+@app_commands.guild_only()
+async def setup_reports(interaction: discord.Interaction):
+
+    if not is_manager(interaction.user):
+        await interaction.response.send_message(
+            "У тебя нет прав для этой команды.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    posted = []
+    missing = []
+
+    for direction, channel_name in WORK_CHANNELS.items():
+        channel = discord.utils.get(
+            interaction.guild.text_channels,
+            name=channel_name
+        )
+
+        if channel is None:
+            missing.append(channel_name)
+            continue
+
+        await channel.send(
+            "📸 **Ежедневный отчёт автофинки**\n"
+            "Нажми кнопку ниже, чтобы отправить скриншот "
+            "выполненной автофинки.",
+            view=SubmitView()
+        )
+
+        posted.append(direction)
+
+    result = "✅ Кнопки размещены в: " + ", ".join(posted)
+
+    if missing:
+        result += "\n⚠️ Не найдены каналы: " + ", ".join(missing)
+
+    await interaction.followup.send(result, ephemeral=True)
+
 
 bot.run(TOKEN)
