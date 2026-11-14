@@ -125,7 +125,7 @@ SERVER_TZ = ZoneInfo("Europe/Moscow")
 
 
 def get_work_date():
-    now = datetime.now(KYIV_TZ)
+    now = datetime.now(SERVER_TZ)
 
     if now.hour < 5:
         now -= timedelta(days=1)
