@@ -11,7 +11,7 @@ from discord.ext import tasks
 
 
 # ============================================================
-# KARMA — AUTO FINKA MANAGER
+# KARMA NOIRE — BIZINFO
 # Existing database is kept at /app/data/karma.db
 # ============================================================
 
@@ -21,6 +21,15 @@ DB_PATH = "/app/data/karma.db"
 DIRECTIONS = ["Mesa", "Surprise", "Prescott", "Faraway"]
 
 REVIEW_CHANNEL_NAME = "проверка-отчётов"
+REJECTION_CHANNEL_NAME = "журнал-действий"
+FINANCE_CHANNEL_NAME = "финансы"
+STATS_CHANNEL_NAME = "статистика"
+TICKET_PANEL_CHANNEL_NAME = "создать-заявку"
+TICKET_CATEGORY_NAME = "05・ТИКЕТЫ"
+TICKET_LOG_CHANNEL_NAME = "заявки-на-вступление"
+ADMIN_ROLE_NAMES = ("Владелец", "Администратор")
+OWNER_ROLE_NAME = "Владелец"
+RECRUIT_ROLE_NAME = "Новобранец"
 
 WORK_CHANNELS = {
     "Mesa": "mesa・работа",
@@ -154,6 +163,50 @@ def init_database():
             )
         """)
 
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS point_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER NOT NULL,
+                points INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                admin_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (employee_id) REFERENCES employees(id)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS report_sessions (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                channel_id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                purpose TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                nickname TEXT NOT NULL,
+                game_server TEXT NOT NULL,
+                age TEXT NOT NULL,
+                real_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                closed_at TEXT,
+                reviewer_id TEXT
+            )
+        """)
+
         for name in DIRECTIONS:
             db.execute(
                 "INSERT OR IGNORE INTO servers (name) VALUES (?)",
@@ -176,13 +229,18 @@ def now_iso():
 
 def is_manager(member):
     return isinstance(member, discord.Member) and any(
-        role.name in ("Владелец", "Администратор")
-        for role in member.roles
+        role.name in ADMIN_ROLE_NAMES for role in member.roles
+    )
+
+
+def is_owner(member):
+    return isinstance(member, discord.Member) and any(
+        role.name == OWNER_ROLE_NAME for role in member.roles
     )
 
 
 def money(value):
-    return f"{int(value):,}".replace(",", " ")
+    return f"{int(value):,}".replace(",", ".") + "$"
 
 
 def make_embed(title, description=None):
@@ -192,7 +250,7 @@ def make_embed(title, description=None):
         color=DARK_COLOR,
         timestamp=discord.utils.utcnow()
     )
-    embed.set_footer(text="K A R M A  •  AUTO FINKA")
+    embed.set_footer(text="K A R M A  N O I R E  •  BIZINFO")
     return embed
 
 
@@ -234,6 +292,11 @@ def get_employee_totals(db, employee_id):
         (employee_id,)
     ).fetchone()[0]
 
+    adjustments = db.execute(
+        "SELECT COALESCE(SUM(points), 0) FROM point_adjustments WHERE employee_id = ?",
+        (employee_id,)
+    ).fetchone()[0]
+    earned = int(earned) + int(adjustments)
     unpaid = max(0, earned - paid)
     return int(earned), int(paid), int(unpaid)
 
@@ -302,18 +365,35 @@ class KarmaBot(discord.Client):
         # Persistent buttons keep working after a bot restart.
         self.add_view(SubmitView())
         self.add_view(ReviewView())
+        self.add_view(TicketPanelView())
+        self.add_view(TicketControlView())
 
         await self.tree.sync()
         print("Karma commands synchronized!")
 
         if not daily_reminder.is_running():
             daily_reminder.start()
+        if not daily_cleanup.is_running():
+            daily_cleanup.start()
 
     async def on_ready(self):
         print(f"Karma is online as {self.user}")
 
 
 bot = KarmaBot()
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    panel = discord.utils.get(member.guild.text_channels, name=TICKET_PANEL_CHANNEL_NAME)
+    if panel:
+        try:
+            await member.send(
+                f"Добро пожаловать на **Karma Noire / BIZINFO**. Для вступления создай заявку здесь: https://discord.com/channels/{member.guild.id}/{panel.id}. "
+                "После заполнения анкеты откроется приватный тикет с администрацией."
+            )
+        except discord.HTTPException:
+            pass
 
 
 # ============================================================
@@ -366,7 +446,7 @@ class SubmitView(discord.ui.View):
 
             if not employee or employee["direction"] != direction:
                 await interaction.response.send_message(
-                    "У тебя нет активного назначения на это направление.",
+                    "У тебя нет активного назначения на этот Server.",
                     ephemeral=True
                 )
                 return
@@ -405,12 +485,14 @@ class SubmitView(discord.ui.View):
                 )
                 return
 
-        bot.waiting_for_report[
-            (interaction.guild_id, interaction.user.id)
-        ] = interaction.channel_id
+        with database() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO report_sessions (guild_id, user_id, channel_id, created_at) VALUES (?, ?, ?, ?)",
+                (str(interaction.guild_id), str(interaction.user.id), str(interaction.channel_id), now_iso())
+            )
 
         await interaction.response.send_message(
-            "Отправь скриншот автофинки следующим сообщением в этом канале.",
+            "Пришли скриншот следующим сообщением. Текстовые сообщения в рабочем канале не сохраняются.",
             ephemeral=True
         )
 
@@ -551,7 +633,7 @@ class ApprovalModal(discord.ui.Modal, title="Подтверждение отчё
             )
 
         await interaction.followup.send(
-            f"Отчёт принят. Начислено **{points}** баллов "
+            f"Отчёт принят. Начислено **{points} {points_word(points)}** "
             f"({money(points * POINT_VALUE)}).",
             ephemeral=True
         )
@@ -626,8 +708,34 @@ class RejectionModal(discord.ui.Modal, title="Отклонение отчёта"
                 f"ОТКЛОНЁН • {self.reason.value} • проверил {interaction.user.mention}"
             )
 
+        # Notify the employee privately and publish a mention in the admin action log.
+        with database() as db:
+            info = db.execute(
+                "SELECT e.discord_id, e.direction FROM submissions s JOIN employees e ON e.id=s.employee_id WHERE s.id=?",
+                (self.submission_id,)
+            ).fetchone()
+        if info and interaction.guild:
+            employee_id = int(info["discord_id"])
+            reason_text = self.reason.value
+            try:
+                user = bot.get_user(employee_id) or await bot.fetch_user(employee_id)
+                await user.send(
+                    f"Твой отчёт по Server **{info['direction']}** отклонён.\n"
+                    f"Причина: {reason_text}\n"
+                    "Исправь ошибку и отправь новый скриншот через кнопку в рабочем канале."
+                )
+            except discord.HTTPException:
+                pass
+            log_channel = discord.utils.get(interaction.guild.text_channels, name=REJECTION_CHANNEL_NAME)
+            if log_channel:
+                notice = make_embed("KARMA NOIRE | ОТЧЁТ ОТКЛОНЁН", f"{f'<@{employee_id}>'}, твоя заявка не одобрена.")
+                notice.add_field(name="SERVER", value=info["direction"], inline=True)
+                notice.add_field(name="ПРИЧИНА", value=reason_text[:1024], inline=False)
+                notice.add_field(name="ДАЛЬШЕ", value="Исправь замечания и отправь отчёт повторно.", inline=False)
+                await log_channel.send(content=f"<@{employee_id}>", embed=notice)
+
         await interaction.followup.send(
-            "Отчёт отклонён. Сотрудник сможет отправить исправленный скриншот.",
+            "Отчёт отклонён. Сотрудник получил уведомление с причиной отказа.",
             ephemeral=True
         )
 
@@ -684,7 +792,7 @@ class ReviewView(discord.ui.View):
 
         if business_count < 1:
             await interaction.response.send_message(
-                "Для этого направления ещё не настроено количество бизнесов. "
+                "Для этого Server ещё не настроено количество бизнесов. "
                 "Сначала используй команду /businesses.",
                 ephemeral=True
             )
@@ -749,199 +857,112 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    key = (message.guild.id, message.author.id)
-    expected_channel = bot.waiting_for_report.get(key)
-
-    if expected_channel is None:
-        return
-
-    if message.channel.id != expected_channel:
-        return
-
-    if not message.attachments:
-        return
-
-    image_attachment = next(
-        (
-            attachment for attachment in message.attachments
-            if attachment.content_type
-            and attachment.content_type.startswith("image/")
-        ),
+    channel_direction = next(
+        (server for server, channel_name in WORK_CHANNELS.items() if channel_name == message.channel.name),
         None
     )
-
-    if image_attachment is None:
-        await message.reply("Пришли именно изображение.")
+    if channel_direction is None or is_manager(message.author):
         return
 
-    direction = next(
-        (
-            name for name, channel_name in WORK_CHANNELS.items()
-            if channel_name == message.channel.name
-        ),
-        None
-    )
+    # Work channels are submission-only: no ordinary chat is retained.
+    key = (str(message.guild.id), str(message.author.id))
+    with database() as db:
+        session = db.execute(
+            "SELECT channel_id FROM report_sessions WHERE guild_id=? AND user_id=?",
+            key
+        ).fetchone()
 
-    if direction is None:
-        await message.reply("Не удалось определить направление.")
-        return
+    is_expected = session and str(message.channel.id) == session["channel_id"]
+    attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/")), None)
 
-    review_channel = discord.utils.get(
-        message.guild.text_channels,
-        name=REVIEW_CHANNEL_NAME
-    )
-
-    if review_channel is None:
-        await message.reply("Не найден канал проверки отчётов.")
+    if not is_expected or attachment is None:
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        if is_expected and attachment is None:
+            try:
+                await message.author.send("В рабочем канале принимаются только скриншоты. Нажми кнопку «Отправить отчёт» и приложи изображение.")
+            except discord.HTTPException:
+                pass
         return
 
     work_date = get_work_date()
+    review_channel = discord.utils.get(message.guild.text_channels, name=REVIEW_CHANNEL_NAME)
+    if review_channel is None:
+        try:
+            await message.delete()
+            await message.author.send("Не найден канал проверки отчётов. Сообщи администрации.")
+        except discord.HTTPException:
+            pass
+        return
 
     with database() as db:
         employee = db.execute(
-            """
-            SELECT id, direction
-            FROM employees
-            WHERE discord_id = ? AND status = 'active'
-            """,
+            "SELECT id, direction FROM employees WHERE discord_id=? AND status='active'",
             (str(message.author.id),)
         ).fetchone()
-
-        if not employee or employee["direction"] != direction:
-            bot.waiting_for_report.pop(key, None)
-            await message.reply(
-                "У тебя нет активного назначения на этот рабочий канал."
-            )
+        if not employee or employee["direction"] != channel_direction:
+            db.execute("DELETE FROM report_sessions WHERE guild_id=? AND user_id=?", key)
+            try:
+                await message.delete()
+                await message.author.send("У тебя нет активного назначения на этот Server.")
+            except discord.HTTPException:
+                pass
             return
 
-        server = db.execute(
-            "SELECT business_count FROM servers WHERE name = ?",
-            (direction,)
-        ).fetchone()
-
-        if not server or server["business_count"] < 1:
-            await message.reply(
-                "Для этого направления ещё не настроено количество бизнесов. "
-                "Обратись к администрации."
-            )
-            return
-
+        server = db.execute("SELECT business_count FROM servers WHERE name=?", (channel_direction,)).fetchone()
         approved = db.execute(
-            """
-            SELECT id FROM submissions
-            WHERE employee_id = ?
-              AND work_date = ?
-              AND status = 'approved'
-            """,
+            "SELECT id FROM submissions WHERE employee_id=? AND work_date=? AND status='approved'",
             (employee["id"], work_date)
         ).fetchone()
-
-        if approved:
-            bot.waiting_for_report.pop(key, None)
-            await message.reply(
-                "Отчёт за сегодняшний рабочий день уже принят."
-            )
-            return
-
         pending = db.execute(
-            """
-            SELECT id FROM submissions
-            WHERE employee_id = ? AND status = 'pending'
-            """,
+            "SELECT id FROM submissions WHERE employee_id=? AND status='pending'",
             (employee["id"],)
         ).fetchone()
-
-        if pending:
-            bot.waiting_for_report.pop(key, None)
-            await message.reply(
-                "У тебя уже есть отчёт, ожидающий проверки."
-            )
+        if not server or server["business_count"] < 1 or approved or pending:
+            db.execute("DELETE FROM report_sessions WHERE guild_id=? AND user_id=?", key)
+            try:
+                await message.delete()
+                await message.author.send("Отчёт не принят: проверь количество бизнесов, текущие заявки и статус отчёта за сегодня.")
+            except discord.HTTPException:
+                pass
             return
 
         cursor = db.execute(
-            """
-            INSERT INTO submissions
-            (employee_id, work_date, attachment_url, submitted_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                employee["id"],
-                work_date,
-                image_attachment.url,
-                now_iso()
-            )
+            "INSERT INTO submissions (employee_id, work_date, attachment_url, submitted_at) VALUES (?, ?, ?, ?)",
+            (employee["id"], work_date, attachment.url, now_iso())
         )
         submission_id = cursor.lastrowid
 
-    embed = make_embed(
-        "K A R M A  |  AUTO FINKA",
-        "НОВЫЙ ОТЧЁТ НА ПРОВЕРКУ"
-    )
-
-    embed.add_field(
-        name="СОТРУДНИК",
-        value=message.author.mention,
-        inline=True
-    )
-    embed.add_field(
-        name="НАПРАВЛЕНИЕ",
-        value=direction.upper(),
-        inline=True
-    )
-    embed.add_field(
-        name="РАБОЧАЯ ДАТА",
-        value=work_date,
-        inline=True
-    )
-    embed.add_field(
-        name="СТАТУС",
-        value="ОЖИДАЕТ ПРОВЕРКИ",
-        inline=False
-    )
-
-    embed.set_image(
-        url=f"attachment://{image_attachment.filename}"
-    )
-    embed.set_footer(
-        text=f"KARMA NOIRE  •  REPORT #{submission_id}"
-    )
+    embed = make_embed("KARMA NOIRE | BIZINFO", "НОВАЯ ЗАЯВКА НА ПРОВЕРКУ")
+    embed.add_field(name="СОТРУДНИК", value=message.author.mention, inline=True)
+    embed.add_field(name="SERVER", value=channel_direction, inline=True)
+    embed.add_field(name="РАБОЧАЯ ДАТА", value=work_date, inline=True)
+    embed.add_field(name="СТАТУС", value="ОЖИДАЕТ ПРОВЕРКИ", inline=False)
+    embed.set_image(url=f"attachment://{attachment.filename}")
+    embed.set_footer(text=f"KARMA NOIRE • REPORT #{submission_id}")
 
     try:
-        review_message = await review_channel.send(
-            embed=embed,
-            file=await image_attachment.to_file(),
-            view=ReviewView()
-        )
-
+        review_message = await review_channel.send(embed=embed, file=await attachment.to_file(), view=ReviewView())
         with database() as db:
-            db.execute(
-                """
-                UPDATE submissions
-                SET review_message_id = ?
-                WHERE id = ?
-                """,
-                (str(review_message.id), submission_id)
-            )
-
+            db.execute("UPDATE submissions SET review_message_id=? WHERE id=?", (str(review_message.id), submission_id))
+            db.execute("DELETE FROM report_sessions WHERE guild_id=? AND user_id=?", key)
+        await message.delete()
+        try:
+            await message.author.send(f"Твой отчёт по Server **{channel_direction}** передан администрации на проверку.")
+        except discord.HTTPException:
+            pass
     except Exception as error:
         print(f"Report sending error: {error}")
-
         with database() as db:
-            db.execute(
-                "DELETE FROM submissions WHERE id = ? AND status = 'pending'",
-                (submission_id,)
-            )
-
-        await message.reply(
-            "Не удалось передать отчёт администрации. Попробуй ещё раз."
-        )
-        return
-
-    bot.waiting_for_report.pop(key, None)
-
-    await message.reply(
-        "Твой отчёт передан администрации на проверку."
-    )
+            db.execute("DELETE FROM submissions WHERE id=? AND status='pending'", (submission_id,))
+            db.execute("DELETE FROM report_sessions WHERE guild_id=? AND user_id=?", key)
+        try:
+            await message.delete()
+            await message.author.send("Не удалось передать отчёт. Попробуй снова через кнопку.")
+        except discord.HTTPException:
+            pass
 
 
 # ============================================================
@@ -997,7 +1018,7 @@ async def daily_reminder():
             try:
                 await user.send(
                     f"Напоминание Karma: сегодня ещё не отправлен отчёт "
-                    f"по направлению **{employee['direction']}**."
+                    f"по Server **{employee['direction']}**."
                 )
 
                 db.execute(
@@ -1016,6 +1037,79 @@ async def daily_reminder():
                 )
 
 
+async def ensure_report_panel(channel, server_name):
+    with database() as db:
+        saved = db.execute("SELECT message_id FROM bot_messages WHERE channel_id=? AND purpose='report_panel'", (str(channel.id),)).fetchone()
+    message = None
+    if saved:
+        try:
+            message = await channel.fetch_message(int(saved["message_id"]))
+        except discord.HTTPException:
+            message = None
+    embed = make_embed("KARMA NOIRE | BIZINFO", "ЕЖЕДНЕВНАЯ ПОДАЧА ОТЧЁТА")
+    embed.add_field(name="SERVER", value=server_name, inline=True)
+    embed.add_field(name="ПОРЯДОК", value="Нажми кнопку и отправь скриншот следующим сообщением. Рабочий канал предназначен только для отчётов.", inline=False)
+    if message:
+        await message.edit(embed=embed, view=SubmitView())
+    else:
+        message = await channel.send(embed=embed, view=SubmitView())
+    with database() as db:
+        db.execute("INSERT OR REPLACE INTO bot_messages (channel_id, message_id, purpose) VALUES (?, ?, 'report_panel')", (str(channel.id), str(message.id)))
+    # Remove everything else, leaving exactly one panel message.
+    async for old in channel.history(limit=None):
+        if old.id != message.id:
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+
+
+@tasks.loop(time=time(hour=5, minute=0, tzinfo=SERVER_TZ))
+async def daily_cleanup():
+    with database() as db:
+        db.execute("DELETE FROM report_sessions")
+    for guild in bot.guilds:
+        for server_name, channel_name in WORK_CHANNELS.items():
+            channel = discord.utils.get(guild.text_channels, name=channel_name)
+            if channel:
+                try:
+                    await ensure_report_panel(channel, server_name)
+                except Exception as error:
+                    print(f"Daily cleanup failed for {channel_name}: {error}")
+        stats_channel = discord.utils.get(guild.text_channels, name=STATS_CHANNEL_NAME)
+        if stats_channel:
+            with database() as db:
+                server_rows = db.execute("""
+                    SELECT s.name, s.business_count, e.discord_id
+                    FROM servers s LEFT JOIN employees e
+                    ON e.direction=s.name AND e.status='active'
+                    ORDER BY s.name
+                """).fetchall()
+            overview = make_embed("KARMA NOIRE | ЕЖЕДНЕВНАЯ СВОДКА", f"Рабочая дата: **{get_work_date()}**")
+            for row in server_rows:
+                person = f"<@{row['discord_id']}>" if row['discord_id'] else "Свободный слот"
+                overview.add_field(name=f"SERVER: {row['name']}", value=f"Бизнесов: **{row['business_count']}**\nСотрудник: {person}", inline=True)
+            with database() as db:
+                saved_stats = db.execute("SELECT message_id FROM bot_messages WHERE channel_id=? AND purpose='daily_stats'", (str(stats_channel.id),)).fetchone()
+            stats_message = None
+            if saved_stats:
+                try:
+                    stats_message = await stats_channel.fetch_message(int(saved_stats["message_id"]))
+                except discord.HTTPException:
+                    pass
+            if stats_message:
+                await stats_message.edit(embed=overview)
+            else:
+                stats_message = await stats_channel.send(embed=overview)
+            with database() as db:
+                db.execute("INSERT OR REPLACE INTO bot_messages (channel_id,message_id,purpose) VALUES (?,?,'daily_stats')", (str(stats_channel.id), str(stats_message.id)))
+
+
+@daily_cleanup.before_loop
+async def before_daily_cleanup():
+    await bot.wait_until_ready()
+
+
 @daily_reminder.before_loop
 async def before_daily_reminder():
     await bot.wait_until_ready()
@@ -1032,7 +1126,7 @@ async def before_daily_reminder():
 @app_commands.guild_only()
 async def ping(interaction: discord.Interaction):
     embed = make_embed(
-        "K A R M A",
+        "KARMA NOIRE | BIZINFO",
         "Система работает. Все основные службы на связи."
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1044,17 +1138,17 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="invite",
-    description="Принять сотрудника на направление"
+    description="Принять сотрудника на Server"
 )
 @app_commands.guild_only()
-@app_commands.choices(direction=[
+@app_commands.choices(server=[
     app_commands.Choice(name=name, value=name)
     for name in DIRECTIONS
 ])
 async def invite(
     interaction: discord.Interaction,
     member: discord.Member,
-    direction: app_commands.Choice[str]
+    server: app_commands.Choice[str]
 ):
     if not is_manager(interaction.user):
         await interaction.response.send_message(
@@ -1070,13 +1164,13 @@ async def invite(
         )
         return
 
-    direction_name = direction.value
+    direction_name = server.value
 
     with database() as db:
         active_employee = get_employee_by_discord_id(db, member.id)
         if active_employee:
             await interaction.response.send_message(
-                f"{member.mention} уже работает на направлении "
+                f"{member.mention} уже работает на Server "
                 f"**{active_employee['direction']}**.",
                 ephemeral=True
             )
@@ -1092,7 +1186,7 @@ async def invite(
 
         if occupied:
             await interaction.response.send_message(
-                f"Направление **{direction_name}** уже занято.",
+                f"Server **{direction_name}** уже занят.",
                 ephemeral=True
             )
             return
@@ -1142,7 +1236,7 @@ async def invite(
             )
 
         await interaction.followup.send(
-            f"{member.mention} принят на направление **{direction_name}**.\n"
+            f"{member.mention} принят на Server **{direction_name}**.\n"
             f"Номер сотрудника: `{employee_id}`",
             ephemeral=True
         )
@@ -1244,9 +1338,9 @@ class UninviteView(discord.ui.View):
                 item.disabled = True
 
             await interaction.followup.send(
-                f"{self.member.mention} уволен с направления "
+                f"{self.member.mention} уволен с Server "
                 f"**{self.direction}**.\n"
-                f"Неоплаченные баллы: **{unpaid}**\n"
+                f"Неоплаченные баллы: **{unpaid} {points_word(unpaid)}**\n"
                 f"К выплате: **{money(unpaid * POINT_VALUE)}**\n"
                 "История сотрудника сохранена.",
                 ephemeral=True
@@ -1318,11 +1412,11 @@ async def uninvite(
         _, _, unpaid = get_employee_totals(db, employee_id)
 
     embed = make_embed(
-        "K A R M A  |  УВОЛЬНЕНИЕ",
+        "KARMA NOIRE | УВОЛЬНЕНИЕ",
         "Проверь данные перед подтверждением."
     )
     embed.add_field(name="СОТРУДНИК", value=member.mention, inline=True)
-    embed.add_field(name="НАПРАВЛЕНИЕ", value=direction, inline=True)
+    embed.add_field(name="SERVER", value=direction, inline=True)
     embed.add_field(name="НЕОПЛАЧЕННЫЕ БАЛЛЫ", value=str(unpaid), inline=True)
     embed.add_field(
         name="К ВЫПЛАТЕ",
@@ -1349,16 +1443,16 @@ async def uninvite(
 
 @bot.tree.command(
     name="businesses",
-    description="Установить количество бизнесов на направлении"
+    description="Установить количество бизнесов на Server"
 )
 @app_commands.guild_only()
-@app_commands.choices(direction=[
+@app_commands.choices(server=[
     app_commands.Choice(name=name, value=name)
     for name in DIRECTIONS
 ])
 async def businesses(
     interaction: discord.Interaction,
-    direction: app_commands.Choice[str],
+    server: app_commands.Choice[str],
     count: app_commands.Range[int, 0, 1000]
 ):
     if not is_manager(interaction.user):
@@ -1371,7 +1465,7 @@ async def businesses(
     with database() as db:
         db.execute(
             "UPDATE servers SET business_count = ? WHERE name = ?",
-            (count, direction.value)
+            (count, server.value)
         )
         db.execute(
             """
@@ -1381,13 +1475,13 @@ async def businesses(
             """,
             (
                 "BUSINESSES_UPDATED",
-                f"{direction.value}; count={count}",
+                f"{server.value}; count={count}",
                 now_iso()
             )
         )
 
     await interaction.response.send_message(
-        f"Для направления **{direction.value}** установлено "
+        f"Для Server **{server.value}** установлено "
         f"**{count}** бизнесов.",
         ephemeral=True
     )
@@ -1456,19 +1550,19 @@ async def stats(
         ).fetchone()[0]
 
     embed = make_embed(
-        "K A R M A  |  СТАТИСТИКА",
+        "KARMA NOIRE | СТАТИСТИКА",
         f"Сотрудник: {member.mention}"
     )
-    embed.add_field(name="НАПРАВЛЕНИЕ", value=employee["direction"], inline=True)
+    embed.add_field(name="SERVER", value=employee["direction"], inline=True)
     embed.add_field(name="СТАТУС", value=employee["status"], inline=True)
     embed.add_field(name="ВСЕГО БАЛЛОВ", value=str(earned), inline=True)
     embed.add_field(name="ОПЛАЧЕНО", value=str(paid), inline=True)
-    embed.add_field(name="К ВЫПЛАТЕ", value=f"{unpaid} баллов\n{money(unpaid * POINT_VALUE)}", inline=True)
+    embed.add_field(name="К ВЫПЛАТЕ", value=f"{unpaid} {points_word(unpaid)}\n{money(unpaid * POINT_VALUE)}", inline=True)
     embed.add_field(name="ОТЧЁТЫ", value=f"Принято: {approved}\nОтклонено: {rejected}", inline=True)
 
     if daily:
         daily_text = "\n".join(
-            f"`{row['work_date']}` — **{row['points']}** баллов"
+            f"`{row['work_date']}` — **{row['points']} {points_word(row['points'])}**"
             for row in daily
         )
     else:
@@ -1555,6 +1649,13 @@ async def paid(
         f"Сумма: **{money(amount)}**",
         ephemeral=True
     )
+    finance_channel = discord.utils.get(interaction.guild.text_channels, name=FINANCE_CHANNEL_NAME)
+    if finance_channel:
+        finance_embed = make_embed("KARMA NOIRE | ВЫПЛАТА ЗАФИКСИРОВАНА", f"Получатель: {member.mention}")
+        finance_embed.add_field(name="БАЛЛЫ", value=f"{unpaid} {points_word(unpaid)}", inline=True)
+        finance_embed.add_field(name="СУММА", value=money(amount), inline=True)
+        finance_embed.add_field(name="SERVER", value=employee["direction"], inline=True)
+        await finance_channel.send(embed=finance_embed)
 
 
 # ============================================================
@@ -1563,7 +1664,7 @@ async def paid(
 
 @bot.tree.command(
     name="payroll",
-    description="Сформировать недельный отчёт по всем направлениям"
+    description="Сформировать недельный отчёт по всем серверам"
 )
 @app_commands.guild_only()
 async def payroll(interaction: discord.Interaction):
@@ -1582,6 +1683,11 @@ async def payroll(interaction: discord.Interaction):
     with database() as db:
         rows = db.execute(
             """
+            WITH entries AS (
+                SELECT employee_id, work_date, points FROM daily_entries
+                UNION ALL
+                SELECT employee_id, substr(created_at, 1, 10) AS work_date, points FROM point_adjustments
+            )
             SELECT
                 e.id AS employee_id,
                 e.discord_id,
@@ -1589,7 +1695,7 @@ async def payroll(interaction: discord.Interaction):
                 e.status,
                 SUM(d.points) AS points
             FROM employees e
-            JOIN daily_entries d ON d.employee_id = e.id
+            JOIN entries d ON d.employee_id = e.id
             WHERE d.work_date BETWEEN ? AND ?
             GROUP BY e.id
             ORDER BY e.direction, e.id
@@ -1599,8 +1705,13 @@ async def payroll(interaction: discord.Interaction):
 
         daily_rows = db.execute(
             """
+            WITH entries AS (
+                SELECT employee_id, work_date, points FROM daily_entries
+                UNION ALL
+                SELECT employee_id, substr(created_at, 1, 10) AS work_date, points FROM point_adjustments
+            )
             SELECT employee_id, work_date, SUM(points) AS points
-            FROM daily_entries
+            FROM entries
             WHERE work_date BETWEEN ? AND ?
             GROUP BY employee_id, work_date
             ORDER BY work_date
@@ -1640,12 +1751,12 @@ async def payroll(interaction: discord.Interaction):
 
         lines.append(
             f"**{row['direction']}** — {user_name} ({row['status']})\n"
-            f"Баллы: **{points}** • Сумма: **{money(points * POINT_VALUE)}**\n"
+            f"Баллы: **{points} {points_word(points)}** • Сумма: **{money(points * POINT_VALUE)}**\n"
             f"По дням: {daily_text or 'нет данных'}"
         )
 
     embed = make_embed(
-        "K A R M A  |  НЕДЕЛЬНАЯ ВЕДОМОСТЬ",
+        "KARMA NOIRE | НЕДЕЛЬНАЯ ВЕДОМОСТЬ",
         f"Период: **{start_date} — {end_date}**"
     )
 
@@ -1666,7 +1777,7 @@ async def payroll(interaction: discord.Interaction):
     embed.add_field(
         name="ОБЩИЙ ИТОГ",
         value=(
-            f"Баллы: **{total_points}**\n"
+            f"Баллы: **{total_points} {points_word(total_points)}**\n"
             f"Сумма: **{money(total_points * POINT_VALUE)}**"
         ),
         inline=False
@@ -1678,7 +1789,7 @@ async def payroll(interaction: discord.Interaction):
     )
 
     for chunk in chunks[1:]:
-        extra = make_embed("K A R M A  |  НЕДЕЛЬНАЯ ВЕДОМОСТЬ")
+        extra = make_embed("KARMA NOIRE | НЕДЕЛЬНАЯ ВЕДОМОСТЬ")
         extra.description = chunk
         await interaction.followup.send(embed=extra, ephemeral=True)
 
@@ -1710,14 +1821,14 @@ async def employees(interaction: discord.Interaction):
             """
         ).fetchall()
 
-    embed = make_embed("K A R M A  |  СОТРУДНИКИ")
+    embed = make_embed("KARMA NOIRE | СОТРУДНИКИ")
 
     if not rows:
         embed.description = "Активных сотрудников нет."
     else:
         for row in rows:
             embed.add_field(
-                name=row["direction"],
+                name=f"Server: {row['direction']}",
                 value=f"<@{row['discord_id']}>\nПринят: {row['joined_at'][:10]}",
                 inline=True
             )
@@ -1727,7 +1838,7 @@ async def employees(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="servers",
-    description="Показать направления и количество бизнесов"
+    description="Показать Server и количество бизнесов"
 )
 @app_commands.guild_only()
 async def servers(interaction: discord.Interaction):
@@ -1752,7 +1863,7 @@ async def servers(interaction: discord.Interaction):
             """
         ).fetchall()
 
-    embed = make_embed("K A R M A  |  НАПРАВЛЕНИЯ")
+    embed = make_embed("KARMA NOIRE | SERVERS")
 
     for row in rows:
         worker = f"<@{row['discord_id']}>" if row["discord_id"] else "Свободно"
@@ -1800,32 +1911,277 @@ async def setup_reports(interaction: discord.Interaction):
             missing.append(channel_name)
             continue
 
-        embed = make_embed(
-            "K A R M A  |  ЕЖЕДНЕВНЫЙ ОТЧЁТ",
-            "Нажми кнопку ниже, чтобы отправить скриншот выполненной автофинки."
-        )
-        embed.add_field(
-            name="ПОРЯДОК",
-            value=(
-                "1. Нажми «Отправить отчёт».\n"
-                "2. Пришли скриншот следующим сообщением.\n"
-                "3. Дождись проверки администрации."
-            ),
-            inline=False
-        )
-
-        await channel.send(
-            embed=embed,
-            view=SubmitView()
-        )
+        await ensure_report_panel(channel, direction)
         posted.append(direction)
 
-    result = "Кнопки размещены: " + (", ".join(posted) if posted else "нет")
+    result = "Панели отчётов готовы: " + (", ".join(posted) if posted else "нет")
 
     if missing:
         result += "\nНе найдены каналы: " + ", ".join(missing)
 
     await interaction.followup.send(result, ephemeral=True)
+
+
+# ============================================================
+# OWNER POINT ADJUSTMENTS
+# ============================================================
+
+async def adjust_employee_points(interaction, member, points, reason, action):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("Эта команда доступна только владельцу.", ephemeral=True)
+        return
+    with database() as db:
+        employee = get_employee_by_discord_id(db, member.id, active_only=False)
+        if not employee:
+            await interaction.response.send_message("История сотрудника не найдена.", ephemeral=True)
+            return
+        signed = points if action == "add" else -points
+        current = get_employee_totals(db, employee["id"])[2]
+        if action == "remove" and points > current:
+            await interaction.response.send_message(f"Нельзя снять {points} баллов: доступно к корректировке не более {current} неоплаченных баллов.", ephemeral=True)
+            return
+        db.execute("INSERT INTO point_adjustments (employee_id, points, reason, admin_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                   (employee["id"], signed, reason, str(interaction.user.id), now_iso()))
+        db.execute("INSERT INTO audit_log (action, details, created_at) VALUES (?, ?, ?)",
+                   ("POINTS_ADDED" if action == "add" else "POINTS_REMOVED",
+                    f"employee={member.id}; points={signed}; reason={reason}; owner={interaction.user.id}", now_iso()))
+        _, _, unpaid = get_employee_totals(db, employee["id"])
+    embed = make_embed("KARMA NOIRE | КОРРЕКТИРОВКА БАЛАНСА", f"Баланс сотрудника {member.mention} обновлён.")
+    embed.add_field(name="SERVER", value=employee["direction"], inline=True)
+    embed.add_field(name="ИЗМЕНЕНИЕ", value=f"{ '+' if signed > 0 else ''}{signed} {points_word(abs(signed))}", inline=True)
+    embed.add_field(name="ПРИЧИНА", value=reason, inline=False)
+    embed.add_field(name="ТЕКУЩИЙ ДОЛГ", value=f"{unpaid} {points_word(unpaid)} • {money(unpaid * POINT_VALUE)}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    channel = discord.utils.get(interaction.guild.text_channels, name=FINANCE_CHANNEL_NAME)
+    if channel:
+        await channel.send(embed=embed)
+
+
+def points_word(value):
+    n = abs(int(value)) % 100
+    if 11 <= n <= 14:
+        return "баллов"
+    n %= 10
+    if n == 1:
+        return "балл"
+    if 2 <= n <= 4:
+        return "балла"
+    return "баллов"
+
+
+@bot.tree.command(name="add_points", description="Владелец: начислить сотруднику баллы")
+@app_commands.guild_only()
+async def add_points(interaction: discord.Interaction, member: discord.Member,
+                     points: app_commands.Range[int, 1, 100000], reason: app_commands.Range[str, 3, 300]):
+    await adjust_employee_points(interaction, member, points, reason, "add")
+
+
+@bot.tree.command(name="remove_points", description="Владелец: снять у сотрудника баллы")
+@app_commands.guild_only()
+async def remove_points(interaction: discord.Interaction, member: discord.Member,
+                        points: app_commands.Range[int, 1, 100000], reason: app_commands.Range[str, 3, 300]):
+    await adjust_employee_points(interaction, member, points, reason, "remove")
+
+
+# ============================================================
+# TICKETS: APPLICATION PANEL, PRIVATE CHANNELS AND REVIEW
+# ============================================================
+
+class TicketApplicationModal(discord.ui.Modal, title="Заявка в Karma Noire"):
+    nickname = discord.ui.TextInput(label="Игровой никнейм", max_length=80)
+    game_server = discord.ui.TextInput(label="Игровой сервер", max_length=80)
+    age = discord.ui.TextInput(label="Возраст", max_length=3)
+    real_name = discord.ui.TextInput(label="Настоящее имя", max_length=80)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("Заявка создаётся только на сервере.", ephemeral=True)
+            return
+        with database() as db:
+            existing = db.execute("SELECT id FROM tickets WHERE guild_id=? AND user_id=? AND status='pending'",
+                                  (str(interaction.guild.id), str(interaction.user.id))).fetchone()
+        if existing:
+            await interaction.response.send_message("У тебя уже есть открытый тикет. Продолжай общение в нём.", ephemeral=True)
+            return
+        category = discord.utils.get(interaction.guild.categories, name=TICKET_CATEGORY_NAME)
+        if not category:
+            await interaction.response.send_message(f"Не найдена категория **{TICKET_CATEGORY_NAME}**. Сообщи администрации.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        overwrites = {interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        overwrites[interaction.user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+        for role in interaction.guild.roles:
+            if role.name in ADMIN_ROLE_NAMES:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        if interaction.guild.me:
+            overwrites[interaction.guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True, attach_files=True, embed_links=True)
+        try:
+            channel = await interaction.guild.create_text_channel(
+                name=f"ticket-{interaction.user.id % 100000:05d}", category=category,
+                overwrites=overwrites, topic=f"Заявка пользователя {interaction.user.id}"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Karma не может создать тикет. Выдай боту право **Manage Channels** и проверь права категории тикетов.",
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            print(f"Ticket channel creation error: {error}")
+            await interaction.followup.send("Не удалось создать тикет. Попробуй позже или сообщи администрации.", ephemeral=True)
+            return
+        with database() as db:
+            cur = db.execute("INSERT INTO tickets (guild_id,user_id,channel_id,nickname,game_server,age,real_name,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                             (str(interaction.guild.id), str(interaction.user.id), str(channel.id), self.nickname.value.strip(), self.game_server.value.strip(), self.age.value.strip(), self.real_name.value.strip(), now_iso()))
+            ticket_id = cur.lastrowid
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_CREATED',?,?)",
+                       (f"ticket={ticket_id}; user={interaction.user.id}", now_iso()))
+        embed = make_embed("KARMA NOIRE | НОВАЯ ЗАЯВКА", "Администрация рассмотрит анкету и ответит здесь.")
+        embed.add_field(name="ИГРОВОЙ НИКНЕЙМ", value=self.nickname.value, inline=True)
+        embed.add_field(name="SERVER", value=self.game_server.value, inline=True)
+        embed.add_field(name="ВОЗРАСТ", value=self.age.value, inline=True)
+        embed.add_field(name="НАСТОЯЩЕЕ ИМЯ", value=self.real_name.value, inline=True)
+        await channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
+        log = discord.utils.get(interaction.guild.text_channels, name=TICKET_LOG_CHANNEL_NAME)
+        if log:
+            await log.send(embed=make_embed("KARMA NOIRE | НОВЫЙ ТИКЕТ", f"{interaction.user.mention} создал {channel.mention}. Заявка №{ticket_id}."))
+        await interaction.followup.send(f"Тикет создан: {channel.mention}. Только ты и администрация имеют к нему доступ.", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Создать заявку", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:create")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketApplicationModal())
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def get_ticket(self, interaction):
+        with database() as db:
+            return db.execute("SELECT * FROM tickets WHERE channel_id=? AND status='pending'", (str(interaction.channel_id),)).fetchone()
+
+    @discord.ui.button(label="Принять • Новобранец", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+            return
+        ticket = await self.get_ticket(interaction)
+        if not ticket:
+            await interaction.response.send_message("Открытая заявка не найдена.", ephemeral=True)
+            return
+        role = discord.utils.get(interaction.guild.roles, name=RECRUIT_ROLE_NAME)
+        member = interaction.guild.get_member(int(ticket["user_id"]))
+        if not role or not member:
+            await interaction.response.send_message("Не найдена роль «Новобранец» или пользователь.", ephemeral=True)
+            return
+        try:
+            await member.add_roles(role, reason="Заявка принята через Karma Noire")
+        except discord.Forbidden:
+            await interaction.response.send_message("Бот не может выдать роль. Проверь порядок ролей и права.", ephemeral=True)
+            return
+        with database() as db:
+            db.execute("UPDATE tickets SET status='accepted', reviewer_id=? WHERE id=? AND status='pending'", (str(interaction.user.id), ticket["id"]))
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_ACCEPTED',?,?)", (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
+        for child in self.children:
+            child.disabled = child.custom_id != "karma:ticket:close"
+        await interaction.response.edit_message(embed=make_embed("KARMA NOIRE | ЗАЯВКА ПРИНЯТА", f"{member.mention} получил роль **{RECRUIT_ROLE_NAME}**."), view=self)
+        try:
+            await member.send("Твоя заявка в Karma Noire принята. Тебе выдана роль «Новобранец».")
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+            return
+        ticket = await self.get_ticket(interaction)
+        if not ticket:
+            await interaction.response.send_message("Открытая заявка не найдена.", ephemeral=True)
+            return
+        with database() as db:
+            db.execute("UPDATE tickets SET status='rejected', reviewer_id=? WHERE id=?", (str(interaction.user.id), ticket["id"]))
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_REJECTED',?,?)", (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
+        for child in self.children:
+            child.disabled = child.custom_id != "karma:ticket:close"
+        await interaction.response.edit_message(embed=make_embed("KARMA NOIRE | ЗАЯВКА ОТКЛОНЕНА", "Администрация отклонила заявку."), view=self)
+        member = interaction.guild.get_member(int(ticket["user_id"]))
+        if member:
+            try:
+                await member.send("Твоя заявка в Karma Noire отклонена. Если считаешь, что произошла ошибка, свяжись с администрацией.")
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_manager(interaction.user):
+            await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+            return
+        with database() as db:
+            db.execute("UPDATE tickets SET status=CASE WHEN status='pending' THEN 'closed' ELSE status END, reviewer_id=COALESCE(reviewer_id, ?), closed_at=? WHERE channel_id=? AND closed_at IS NULL",
+                       (str(interaction.user.id), now_iso(), str(interaction.channel_id)))
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_CLOSED',?,?)",
+                       (f"channel={interaction.channel_id}; closer={interaction.user.id}", now_iso()))
+        await interaction.response.send_message("Тикет будет закрыт через 5 секунд.", ephemeral=True)
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="setup_tickets", description="Опубликовать панель создания заявок")
+@app_commands.guild_only()
+async def setup_tickets(interaction: discord.Interaction):
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel = discord.utils.get(interaction.guild.text_channels, name=TICKET_PANEL_CHANNEL_NAME)
+    if not channel:
+        await interaction.followup.send(f"Не найден канал {TICKET_PANEL_CHANNEL_NAME}.", ephemeral=True)
+        return
+    with database() as db:
+        saved = db.execute("SELECT message_id FROM bot_messages WHERE channel_id=? AND purpose='ticket_panel'", (str(channel.id),)).fetchone()
+    msg = None
+    if saved:
+        try:
+            msg = await channel.fetch_message(int(saved["message_id"]))
+        except discord.HTTPException:
+            pass
+    embed = make_embed("KARMA NOIRE | BIZINFO", "ДОБРО ПОЖАЛОВАТЬ. ДЛЯ ВСТУПЛЕНИЯ СОЗДАЙ ТИКЕТ.")
+    embed.add_field(name="АНКЕТА", value="Нажми кнопку ниже и заполни игровой никнейм, Server, возраст и настоящее имя. После отправки откроется приватный канал для общения с администрацией.", inline=False)
+    if msg:
+        await msg.edit(embed=embed, view=TicketPanelView())
+    else:
+        msg = await channel.send(embed=embed, view=TicketPanelView())
+    with database() as db:
+        db.execute("INSERT OR REPLACE INTO bot_messages (channel_id,message_id,purpose) VALUES (?,?,'ticket_panel')", (str(channel.id), str(msg.id)))
+    await interaction.followup.send("Панель заявок готова.", ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Показать справочник команд Karma Noire")
+@app_commands.guild_only()
+async def help_command(interaction: discord.Interaction):
+    owner = is_owner(interaction.user)
+    manager = is_manager(interaction.user)
+    embed = make_embed("KARMA NOIRE | СПРАВОЧНИК", "Команды и их назначение")
+    if manager:
+        embed.add_field(name="СОТРУДНИКИ", value="`/invite` — принять сотрудника на Server.\n`/uninvite` — уволить и сохранить историю.\n`/employees` — список сотрудников.", inline=False)
+        embed.add_field(name="ОТЧЁТЫ", value="`/setup_reports` — установить кнопки отчётов.\n`/stats` — статистика сотрудника.\n`/logs` — журнал действий.", inline=False)
+        embed.add_field(name="ФИНАНСЫ", value="`/payroll` — недельная ведомость.\n`/paid` — отметить фактическую выплату.\n`/businesses` — изменить число бизнесов.\n`/servers` — обзор серверов.", inline=False)
+        embed.add_field(name="ТИКЕТЫ", value="`/setup_tickets` — опубликовать панель заявок. Принять, отклонить и закрыть тикет можно кнопками внутри тикета.", inline=False)
+    else:
+        embed.add_field(name="СОТРУДНИК", value="`/help` — справка по доступным командам.\nВ рабочем канале нажми «Отправить отчёт» и приложи скриншот.", inline=False)
+    if owner:
+        embed.add_field(name="КОМАНДЫ ВЛАДЕЛЬЦА", value="`/add_points` — начислить баллы вручную.\n`/remove_points` — снять баллы вручную.", inline=False)
+    embed.add_field(name="ПРОВЕРКА", value="`/ping` — проверить доступность бота.", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================================================
@@ -1855,7 +2211,7 @@ async def logs(interaction: discord.Interaction):
             """
         ).fetchall()
 
-    embed = make_embed("K A R M A  |  ЖУРНАЛ ДЕЙСТВИЙ")
+    embed = make_embed("KARMA NOIRE | ЖУРНАЛ ДЕЙСТВИЙ")
 
     if not rows:
         embed.description = "Записей пока нет."
