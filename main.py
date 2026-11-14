@@ -121,7 +121,16 @@ def init_database():
 
     print("Karma database initialized!")
 
+SERVER_TZ = ZoneInfo("Europe/Moscow")
 
+
+def get_work_date():
+    now = datetime.now(KYIV_TZ)
+
+    if now.hour < 5:
+        now -= timedelta(days=1)
+
+    return now.strftime("%Y-%m-%d")
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -171,7 +180,7 @@ class SubmitView(discord.ui.View):
             "📸 Пришли скриншот автофинки следующим сообщением в этом канале.",
             ephemeral=True
         )
-
+bot.add_view(SubmitView())
 
 def is_manager(member):
     return any(
