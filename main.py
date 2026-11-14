@@ -396,7 +396,6 @@ async def uninvite(
                 for item in self.children:
                     item.disabled = True
 
-                await button_interaction.message.edit(view=self)
 
                 await button_interaction.followup.send(
                     f"✅ {member.mention} уволен с направления "
