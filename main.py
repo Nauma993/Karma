@@ -150,6 +150,7 @@ class KarmaBot(discord.Client):
 
 
 bot = KarmaBot()
+bot.waiting_for_report = {}
 
 REVIEW_CHANNEL_NAME = "проверка-отчётов"
 
@@ -176,8 +177,12 @@ class SubmitView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
+        bot.waiting_for_report[
+            (interaction.guild_id, interaction.user.id)
+        ] = interaction.channel_id
+
         await interaction.response.send_message(
-            "📸 Пришли скриншот автофинки следующим сообщением в этом канале.",
+            "📸 Теперь отправь скриншот автофинки следующим сообщением в этом канале.",
             ephemeral=True
         )
 bot.add_view(SubmitView())
