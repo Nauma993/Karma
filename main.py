@@ -7,16 +7,22 @@ from discord import app_commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = "/app/data/karma.db"
 
+DIRECTIONS = ["Mesa", "Surprise", "Prescott", "Faraway"]
+
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not configured!")
+
+
+def get_db():
+    db = sqlite3.connect(DB_PATH)
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
 
 
 def init_database():
     os.makedirs("/app/data", exist_ok=True)
 
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute("PRAGMA foreign_keys = ON")
-
+    with get_db() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS servers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +87,7 @@ def init_database():
             )
         """)
 
-        for name in ("Mesa", "Surprise", "Prescott", "Faraway"):
+        for name in DIRECTIONS:
             db.execute(
                 "INSERT OR IGNORE INTO servers (name) VALUES (?)",
                 (name,)
@@ -110,11 +116,161 @@ class KarmaBot(discord.Client):
 bot = KarmaBot()
 
 
-@bot.tree.command(name="ping", description="Check if Karma is online")
+def is_manager(member):
+    return any(
+        role.name in ("Владелец", "Администратор")
+        for role in member.roles
+    )
+
+
+@bot.tree.command(
+    name="ping",
+    description="Check if Karma is online"
+)
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Karma is online! Everything works. ✅"
     )
+
+
+@bot.tree.command(
+    name="invite",
+    description="Принять сотрудника на направление"
+)
+@app_commands.guild_only()
+@app_commands.choices(direction=[
+    app_commands.Choice(name=name, value=name)
+    for name in DIRECTIONS
+])
+async def invite(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    direction: app_commands.Choice[str]
+):
+    if not is_manager(interaction.user):
+        await interaction.response.send_message(
+            "У тебя нет прав для этой команды.",
+            ephemeral=True
+        )
+        return
+
+    if member.bot:
+        await interaction.response.send_message(
+            "Нельзя принять бота на работу.",
+            ephemeral=True
+        )
+        return
+
+    direction_name = direction.value
+
+    with get_db() as db:
+        active_employee = db.execute(
+            """
+            SELECT direction FROM employees
+            WHERE discord_id = ? AND status = 'active'
+            """,
+            (str(member.id),)
+        ).fetchone()
+
+        if active_employee:
+            await interaction.response.send_message(
+                f"{member.mention} уже работает на направлении "
+                f"{active_employee[0]}.",
+                ephemeral=True
+            )
+            return
+
+        occupied = db.execute(
+            """
+            SELECT discord_id FROM employees
+            WHERE direction = ? AND status = 'active'
+            """,
+            (direction_name,)
+        ).fetchone()
+
+        if occupied:
+            await interaction.response.send_message(
+                f"Направление {direction_name} уже занято.",
+                ephemeral=True
+            )
+            return
+
+    role = discord.utils.get(
+        interaction.guild.roles,
+        name=direction_name
+    )
+
+    if role is None:
+        await interaction.response.send_message(
+            f"Не найдена роль {direction_name}.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await member.add_roles(
+            role,
+            reason=f"Принят на {direction_name} через Karma"
+        )
+
+        with get_db() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO employees
+                (discord_id, direction, joined_at, status)
+                VALUES (?, ?, ?, 'active')
+                """,
+                (
+                    str(member.id),
+                    direction_name,
+                    discord.utils.utcnow().isoformat()
+                )
+            )
+
+            employee_id = cursor.lastrowid
+
+            db.execute(
+                """
+                INSERT INTO audit_log
+                (action, details, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "INVITE",
+                    f"Employee {member.id}, direction {direction_name}",
+                    discord.utils.utcnow().isoformat()
+                )
+            )
+
+        await interaction.followup.send(
+            f"✅ {member.mention} принят на направление "
+            f"**{direction_name}**!\n"
+            f"Номер сотрудника: `{employee_id}`",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Karma не может выдать роль. Проверь права бота "
+            "и положение его роли в иерархии.",
+            ephemeral=True
+        )
+
+    except Exception as error:
+        try:
+            await member.remove_roles(role)
+        except discord.HTTPException:
+            pass
+
+        print(f"Invite error: {error}")
+
+        await interaction.followup.send(
+            "Не удалось принять сотрудника. "
+            "Подробности находятся в логах Railway.",
+            ephemeral=True
+        )
 
 
 bot.run(TOKEN)
