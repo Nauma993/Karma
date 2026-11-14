@@ -273,4 +273,193 @@ async def invite(
         )
 
 
+@bot.tree.command(
+    name="uninvite",
+    description="Уволить сотрудника и сохранить его историю"
+)
+@app_commands.guild_only()
+async def uninvite(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    if not is_manager(interaction.user):
+        await interaction.response.send_message(
+            "У тебя нет прав для этой команды.",
+            ephemeral=True
+        )
+        return
+
+    with get_db() as db:
+        employee = db.execute(
+            """
+            SELECT id, direction FROM employees
+            WHERE discord_id = ? AND status = 'active'
+            """,
+            (str(member.id),)
+        ).fetchone()
+
+        if not employee:
+            await interaction.response.send_message(
+                "Этот пользователь не числится активным сотрудником.",
+                ephemeral=True
+            )
+            return
+
+        employee_id, direction = employee
+
+        earned = db.execute(
+            """
+            SELECT COALESCE(SUM(points), 0)
+            FROM daily_entries WHERE employee_id = ?
+            """,
+            (employee_id,)
+        ).fetchone()[0]
+
+        paid = db.execute(
+            """
+            SELECT COALESCE(SUM(points), 0)
+            FROM payments WHERE employee_id = ?
+            """,
+            (employee_id,)
+        ).fetchone()[0]
+
+        unpaid = max(0, earned - paid)
+
+    amount = unpaid * 20_000_000
+
+    class UninviteView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=120)
+
+        @discord.ui.button(
+            label="Подтвердить увольнение",
+            style=discord.ButtonStyle.danger
+        )
+        async def confirm(
+            self,
+            button_interaction: discord.Interaction,
+            button: discord.ui.Button
+        ):
+            if button_interaction.user.id != interaction.user.id:
+                await button_interaction.response.send_message(
+                    "Только инициатор команды может подтвердить увольнение.",
+                    ephemeral=True
+                )
+                return
+
+            await button_interaction.response.defer(ephemeral=True)
+
+            role = discord.utils.get(
+                button_interaction.guild.roles,
+                name=direction
+            )
+
+            try:
+                if role and role in member.roles:
+                    await member.remove_roles(
+                        role,
+                        reason="Увольнение через Karma"
+                    )
+
+                with get_db() as db:
+                    cursor = db.execute(
+                        """
+                        UPDATE employees
+                        SET status = 'archived',
+                            left_at = ?
+                        WHERE id = ? AND status = 'active'
+                        """,
+                        (
+                            discord.utils.utcnow().isoformat(),
+                            employee_id
+                        )
+                    )
+
+                    if cursor.rowcount == 0:
+                        raise RuntimeError(
+                            "Сотрудник уже не является активным."
+                        )
+
+                    db.execute(
+                        """
+                        INSERT INTO audit_log
+                        (action, details, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            "UNINVITE",
+                            f"Employee {member.id}, direction {direction}",
+                            discord.utils.utcnow().isoformat()
+                        )
+                    )
+
+                for item in self.children:
+                    item.disabled = True
+
+                await button_interaction.message.edit(view=self)
+
+                await button_interaction.followup.send(
+                    f"✅ {member.mention} уволен с направления "
+                    f"**{direction}**.\n"
+                    f"Неоплаченные баллы: **{unpaid}**\n"
+                    f"К выплате: **{amount:,}**\n"
+                    f"История сотрудника сохранена в архиве.",
+                    ephemeral=True
+                )
+
+            except Exception as error:
+                print(f"Uninvite error: {error}")
+
+                if role:
+                    try:
+                        await member.add_roles(
+                            role,
+                            reason="Восстановление роли после ошибки увольнения"
+                        )
+                    except discord.HTTPException:
+                        pass
+
+                await button_interaction.followup.send(
+                    "Не удалось завершить увольнение. "
+                    "Проверь логи Railway.",
+                    ephemeral=True
+                )
+
+        @discord.ui.button(
+            label="Отмена",
+            style=discord.ButtonStyle.secondary
+        )
+        async def cancel(
+            self,
+            button_interaction: discord.Interaction,
+            button: discord.ui.Button
+        ):
+            if button_interaction.user.id != interaction.user.id:
+                await button_interaction.response.send_message(
+                    "Отменить действие может только его инициатор.",
+                    ephemeral=True
+                )
+                return
+
+            for item in self.children:
+                item.disabled = True
+
+            await button_interaction.response.edit_message(
+                content="Увольнение отменено.",
+                view=self
+            )
+
+    view = UninviteView()
+
+    await interaction.response.send_message(
+        f"**Подтверди увольнение сотрудника**\n\n"
+        f"Сотрудник: {member.mention}\n"
+        f"Направление: **{direction}**\n"
+        f"Неоплаченные баллы: **{unpaid}**\n"
+        f"Сумма к выплате: **{amount:,}**\n\n"
+        f"История будет сохранена.",
+        view=view,
+        ephemeral=True
+    )
+
 bot.run(TOKEN)
