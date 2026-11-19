@@ -34,7 +34,8 @@ REJECTION_CHANNEL_NAME = "журнал-действий"
 FINANCE_CHANNEL_NAME = "финансы"
 STATS_CHANNEL_NAME = "статистика"
 TICKET_PANEL_CHANNEL_NAME = "создать-заявку"
-TICKET_CATEGORY_NAME = "05・ТИКЕТЫ"
+TICKET_CATEGORY_NAME = "05・НОВОБРАНЦЫ"
+WORK_CATEGORY_NAME = "03・РАБОТА"
 TICKET_LOG_CHANNEL_NAME = "заявки-на-вступление"
 ADMIN_ROLE_NAMES = ("Владелец", "Администратор")
 OWNER_ROLE_NAME = "Владелец"
@@ -542,14 +543,57 @@ class KarmaBot(discord.Client):
 bot = KarmaBot()
 
 
+async def restrict_new_member(member: discord.Member):
+    """Hide the server from a new member except the application panel."""
+    guild = member.guild
+    panel = discord.utils.get(guild.text_channels, name=TICKET_PANEL_CHANNEL_NAME)
+    deny = discord.PermissionOverwrite(view_channel=False)
+    allow_panel = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    # Temporary member-specific overwrites are reversible and do not alter other users.
+    for category in guild.categories:
+        try:
+            await category.set_permissions(member, overwrite=deny, reason="Karma: новый участник — доступ только к заявке")
+        except discord.HTTPException as error:
+            print(f"Could not restrict category {category.name} for {member.id}: {error}")
+    for channel in guild.channels:
+        if isinstance(channel, (discord.TextChannel, discord.ForumChannel, discord.VoiceChannel, discord.StageChannel)):
+            try:
+                overwrite = allow_panel if panel and channel.id == panel.id else deny
+                await channel.set_permissions(member, overwrite=overwrite, reason="Karma: новый участник — доступ только к заявке")
+            except discord.HTTPException as error:
+                print(f"Could not restrict channel {channel.name} for {member.id}: {error}")
+    if panel:
+        try:
+            await panel.set_permissions(member, overwrite=allow_panel, reason="Karma: доступ к панели заявок")
+        except discord.HTTPException as error:
+            print(f"Could not allow application panel for {member.id}: {error}")
+
+
+async def restore_member_visibility(member: discord.Member):
+    """Remove temporary member-specific visibility locks after acceptance."""
+    for channel in member.guild.channels:
+        try:
+            if channel.overwrites_for(member) != discord.PermissionOverwrite():
+                await channel.set_permissions(member, overwrite=None, reason="Karma: заявка принята — снять временные ограничения")
+        except discord.HTTPException as error:
+            print(f"Could not restore channel {channel.name} for {member.id}: {error}")
+    for category in member.guild.categories:
+        try:
+            if category.overwrites_for(member) != discord.PermissionOverwrite():
+                await category.set_permissions(member, overwrite=None, reason="Karma: заявка принята — снять временные ограничения")
+        except discord.HTTPException as error:
+            print(f"Could not restore category {category.name} for {member.id}: {error}")
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
+    await restrict_new_member(member)
     panel = discord.utils.get(member.guild.text_channels, name=TICKET_PANEL_CHANNEL_NAME)
     if panel:
         try:
             await member.send(
-                f"Добро пожаловать на **Karma Noire / BIZINFO**. Для вступления создай заявку здесь: https://discord.com/channels/{member.guild.id}/{panel.id}. "
-                "После заполнения анкеты откроется приватный тикет с администрацией."
+                f"Добро пожаловать на **KARMA NOIRE / BIZINFO**. Для вступления заполни заявку: https://discord.com/channels/{member.guild.id}/{panel.id}. "
+                "До рассмотрения заявки тебе доступен только канал подачи заявки."
             )
         except discord.HTTPException:
             pass
@@ -1878,21 +1922,24 @@ async def remove_points(interaction: discord.Interaction, member: discord.Member
 # TICKETS: APPLICATION PANEL, PRIVATE CHANNELS AND REVIEW
 # ============================================================
 
-class TicketApplicationModal(discord.ui.Modal, title="Заявка в Karma Noire"):
-    nickname = discord.ui.TextInput(label="Игровой никнейм", max_length=80)
-    game_server = discord.ui.TextInput(label="Игровой сервер", max_length=80)
-    age = discord.ui.TextInput(label="Возраст", max_length=3)
-    real_name = discord.ui.TextInput(label="Настоящее имя", max_length=80)
+class TicketApplicationModal(discord.ui.Modal, title="KARMA NOIRE • АНКЕТА"):
+    nickname = discord.ui.TextInput(label="Игровой никнейм", placeholder="Укажи свой игровой ник", max_length=80)
+    game_server = discord.ui.TextInput(label="Игровой сервер", placeholder="Mesa / Surprise / Prescott / Faraway", max_length=80)
+    age = discord.ui.TextInput(label="Возраст", placeholder="Полных лет", max_length=3)
+    real_name = discord.ui.TextInput(label="Реальное имя", placeholder="Как к тебе обращаться", max_length=80)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
             await interaction.response.send_message("Заявка создаётся только на сервере.", ephemeral=True)
             return
+        if not self.age.value.strip().isdigit() or not (13 <= int(self.age.value.strip()) <= 99):
+            await interaction.response.send_message("Укажи корректный возраст цифрами (от 13 до 99).", ephemeral=True)
+            return
         with database() as db:
             existing = db.execute("SELECT id FROM tickets WHERE guild_id=? AND user_id=? AND status='pending'",
                                   (str(interaction.guild.id), str(interaction.user.id))).fetchone()
         if existing:
-            await interaction.response.send_message("У тебя уже есть открытый тикет. Продолжай общение в нём.", ephemeral=True)
+            await interaction.response.send_message("У тебя уже есть открытая заявка. Продолжай общение в своём приватном канале.", ephemeral=True)
             return
         category = discord.utils.get(interaction.guild.categories, name=TICKET_CATEGORY_NAME)
         if not category:
@@ -1908,18 +1955,15 @@ class TicketApplicationModal(discord.ui.Modal, title="Заявка в Karma Noir
             overwrites[interaction.guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True, attach_files=True, embed_links=True)
         try:
             channel = await interaction.guild.create_text_channel(
-                name=f"ticket-{interaction.user.id % 100000:05d}", category=category,
-                overwrites=overwrites, topic=f"Заявка пользователя {interaction.user.id}"
+                name=f"заявка-{interaction.user.id % 100000:05d}", category=category,
+                overwrites=overwrites, topic=f"KARMA NOIRE • заявка пользователя {interaction.user.id}"
             )
         except discord.Forbidden:
-            await interaction.followup.send(
-                "Karma не может создать тикет. Выдай боту право **Manage Channels** и проверь права категории тикетов.",
-                ephemeral=True
-            )
+            await interaction.followup.send("Karma не может создать приватный канал. Проверь право Manage Channels.", ephemeral=True)
             return
         except discord.HTTPException as error:
             print(f"Ticket channel creation error: {error}")
-            await interaction.followup.send("Не удалось создать тикет. Попробуй позже или сообщи администрации.", ephemeral=True)
+            await interaction.followup.send("Не удалось создать приватный канал. Попробуй позже или сообщи администрации.", ephemeral=True)
             return
         with database() as db:
             cur = db.execute("INSERT INTO tickets (guild_id,user_id,channel_id,nickname,game_server,age,real_name,created_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -1927,23 +1971,26 @@ class TicketApplicationModal(discord.ui.Modal, title="Заявка в Karma Noir
             ticket_id = cur.lastrowid
             db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_CREATED',?,?)",
                        (f"ticket={ticket_id}; user={interaction.user.id}", now_iso()))
-        embed = make_embed("KARMA NOIRE | НОВАЯ ЗАЯВКА", "Администрация рассмотрит анкету и ответит здесь.")
-        embed.add_field(name="ИГРОВОЙ НИКНЕЙМ", value=self.nickname.value, inline=True)
-        embed.add_field(name="SERVER", value=self.game_server.value, inline=True)
-        embed.add_field(name="ВОЗРАСТ", value=self.age.value, inline=True)
-        embed.add_field(name="НАСТОЯЩЕЕ ИМЯ", value=self.real_name.value, inline=True)
+        embed = make_embed("K A R M A  N O I R E  •  ЗАЯВКА НА ВСТУПЛЕНИЕ",
+                           "**НОВЫЙ КАНДИДАТ**\\nАнкета передана администрации. До принятия решения общение проходит в этом приватном канале.")
+        embed.add_field(name="01  •  ИГРОВОЙ НИК", value=self.nickname.value.strip(), inline=True)
+        embed.add_field(name="02  •  ИГРОВОЙ СЕРВЕР", value=self.game_server.value.strip(), inline=True)
+        embed.add_field(name="03  •  ВОЗРАСТ", value=self.age.value.strip(), inline=True)
+        embed.add_field(name="04  •  РЕАЛЬНОЕ ИМЯ", value=self.real_name.value.strip(), inline=True)
+        embed.add_field(name="СТАТУС", value="`ОЖИДАЕТ РАССМОТРЕНИЯ`", inline=False)
+        embed.set_footer(text="KARMA NOIRE  •  RECRUITMENT DIVISION")
         await channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
         log = discord.utils.get(interaction.guild.text_channels, name=TICKET_LOG_CHANNEL_NAME)
         if log:
-            await log.send(embed=make_embed("KARMA NOIRE | НОВЫЙ ТИКЕТ", f"{interaction.user.mention} создал {channel.mention}. Заявка №{ticket_id}."))
-        await interaction.followup.send(f"Тикет создан: {channel.mention}. Только ты и администрация имеют к нему доступ.", ephemeral=True)
+            await log.send(embed=make_embed("KARMA NOIRE | НОВАЯ ЗАЯВКА", f"{interaction.user.mention} создал {channel.mention}. Заявка №{ticket_id}."))
+        await interaction.followup.send(f"Приватная заявка создана: {channel.mention}.", ephemeral=True)
 
 
 class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Создать заявку", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:create")
+    @discord.ui.button(label="Создать запрос", emoji="✦", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:create")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(TicketApplicationModal())
 
@@ -1956,7 +2003,7 @@ class TicketControlView(discord.ui.View):
         with database() as db:
             return db.execute("SELECT * FROM tickets WHERE channel_id=? AND status='pending'", (str(interaction.channel_id),)).fetchone()
 
-    @discord.ui.button(label="Принять • Новобранец", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:accept")
+    @discord.ui.button(label="Принять • Новобранец", emoji="✦", style=discord.ButtonStyle.success, custom_id="karma:ticket:accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_manager(interaction.user):
             await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
@@ -1968,25 +2015,35 @@ class TicketControlView(discord.ui.View):
         role = discord.utils.get(interaction.guild.roles, name=RECRUIT_ROLE_NAME)
         member = interaction.guild.get_member(int(ticket["user_id"]))
         if not role or not member:
-            await interaction.response.send_message("Не найдена роль «Новобранец» или пользователь.", ephemeral=True)
+            await interaction.response.send_message("Не найдена роль «Новобранец» или пользователь уже покинул сервер.", ephemeral=True)
             return
         try:
-            await member.add_roles(role, reason="Заявка принята через Karma Noire")
+            await member.add_roles(role, reason="Karma Noire: заявка принята")
+            await restore_member_visibility(member)
         except discord.Forbidden:
-            await interaction.response.send_message("Бот не может выдать роль. Проверь порядок ролей и права.", ephemeral=True)
+            await interaction.response.send_message("Бот не может выдать роль или восстановить доступ. Проверь права и иерархию ролей.", ephemeral=True)
             return
         with database() as db:
-            db.execute("UPDATE tickets SET status='accepted', reviewer_id=? WHERE id=? AND status='pending'", (str(interaction.user.id), ticket["id"]))
-            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_ACCEPTED',?,?)", (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
-        for child in self.children:
-            child.disabled = child.custom_id != "karma:ticket:close"
-        await interaction.response.edit_message(embed=make_embed("KARMA NOIRE | ЗАЯВКА ПРИНЯТА", f"{member.mention} получил роль **{RECRUIT_ROLE_NAME}**."), view=self)
+            db.execute("UPDATE tickets SET status='accepted', reviewer_id=?, closed_at=? WHERE id=? AND status='pending'",
+                       (str(interaction.user.id), now_iso(), ticket["id"]))
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_ACCEPTED',?,?)",
+                       (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
+        await interaction.response.edit_message(
+            embed=make_embed("K A R M A  N O I R E  •  ДОПУСК ОДОБРЕН",
+                             f"{member.mention} принят в организацию.\\nВыдана роль **{RECRUIT_ROLE_NAME}**.\\n\\nПерсональный канал будет удалён."),
+            view=None
+        )
         try:
-            await member.send("Твоя заявка в Karma Noire принята. Тебе выдана роль «Новобранец».")
+            await member.send("Твоя заявка в KARMA NOIRE одобрена. Тебе выдана роль «Новобранец». Добро пожаловать.")
         except discord.HTTPException:
             pass
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete(reason=f"Karma: заявка {ticket['id']} принята")
+        except discord.HTTPException as error:
+            print(f"Accepted ticket channel deletion failed: {error}")
 
-    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:reject")
+    @discord.ui.button(label="Отклонить", emoji="✕", style=discord.ButtonStyle.danger, custom_id="karma:ticket:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_manager(interaction.user):
             await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
@@ -1995,20 +2052,37 @@ class TicketControlView(discord.ui.View):
         if not ticket:
             await interaction.response.send_message("Открытая заявка не найдена.", ephemeral=True)
             return
-        with database() as db:
-            db.execute("UPDATE tickets SET status='rejected', reviewer_id=? WHERE id=?", (str(interaction.user.id), ticket["id"]))
-            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_REJECTED',?,?)", (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
-        for child in self.children:
-            child.disabled = child.custom_id != "karma:ticket:close"
-        await interaction.response.edit_message(embed=make_embed("KARMA NOIRE | ЗАЯВКА ОТКЛОНЕНА", "Администрация отклонила заявку."), view=self)
         member = interaction.guild.get_member(int(ticket["user_id"]))
         if member:
             try:
-                await member.send("Твоя заявка в Karma Noire отклонена. Если считаешь, что произошла ошибка, свяжись с администрацией.")
+                await member.send("Твоя заявка в KARMA NOIRE отклонена. Доступ к серверу закрыт.")
             except discord.HTTPException:
                 pass
+            try:
+                await member.kick(reason=f"Karma Noire: заявка {ticket['id']} отклонена")
+            except discord.Forbidden:
+                await interaction.response.send_message("Не удалось исключить пользователя. Проверь право Kick Members и иерархию ролей. Канал заявки пока оставлен.", ephemeral=True)
+                return
+            except discord.HTTPException as error:
+                await interaction.response.send_message(f"Discord не смог исключить пользователя: {error}. Канал заявки пока оставлен.", ephemeral=True)
+                return
+        with database() as db:
+            db.execute("UPDATE tickets SET status='rejected', reviewer_id=?, closed_at=? WHERE id=? AND status='pending'",
+                       (str(interaction.user.id), now_iso(), ticket["id"]))
+            db.execute("INSERT INTO audit_log (action,details,created_at) VALUES ('TICKET_REJECTED',?,?)",
+                       (f"ticket={ticket['id']}; user={ticket['user_id']}; reviewer={interaction.user.id}", now_iso()))
+        await interaction.response.edit_message(
+            embed=make_embed("K A R M A  N O I R E  •  ЗАЯВКА ОТКЛОНЕНА",
+                             "Заявка отклонена. Пользователь исключён с сервера.\\nПерсональный канал будет удалён."),
+            view=None
+        )
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete(reason=f"Karma: заявка {ticket['id']} отклонена")
+        except discord.HTTPException as error:
+            print(f"Rejected ticket channel deletion failed: {error}")
 
-    @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:close")
+    @discord.ui.button(label="Закрыть тикет", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="karma:ticket:close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_manager(interaction.user):
             await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
@@ -2045,8 +2119,15 @@ async def setup_tickets(interaction: discord.Interaction):
             msg = await channel.fetch_message(int(saved["message_id"]))
         except discord.HTTPException:
             pass
-    embed = make_embed("KARMA NOIRE | BIZINFO", "ДОБРО ПОЖАЛОВАТЬ. ДЛЯ ВСТУПЛЕНИЯ СОЗДАЙ ТИКЕТ.")
-    embed.add_field(name="АНКЕТА", value="Нажми кнопку ниже и заполни игровой никнейм, Server, возраст и настоящее имя. После отправки откроется приватный канал для общения с администрацией.", inline=False)
+    embed = make_embed(
+        "K A R M A  N O I R E",
+        "**RECRUITMENT • BIZINFO**\n\n"
+        "Добро пожаловать. Вступление в организацию начинается с анкеты.\n\n"
+        "Нажми кнопку ниже и укажи игровой ник, реальное имя, игровой сервер и возраст. "
+        "После отправки Karma откроет персональный приватный канал для рассмотрения заявки."
+    )
+    embed.add_field(name="ПОРЯДОК ВСТУПЛЕНИЯ", value="`01` Заполни анкету\n`02` Дождись проверки администрации\n`03` Получи решение по заявке", inline=False)
+    embed.set_footer(text="KARMA NOIRE  •  PRIVATE RECRUITMENT")
     if msg:
         await msg.edit(embed=embed, view=TicketPanelView())
     else:
@@ -2240,24 +2321,58 @@ async def add_org(interaction: discord.Interaction, server: app_commands.Choice[
     await interaction.response.send_message(f"Организация **{name}** добавлена.\nСервер: **{SERVER_CODES[server.value]} • {server.value}**\nВладелец: {owner.mention}", ephemeral=True)
 
 
+def division_channel_sort_key(channel):
+    name = channel.name
+    for server_index, base in enumerate(BASE_DIRECTIONS):
+        base_channel = BASE_WORK_CHANNELS[base]
+        if name == base_channel:
+            return (server_index, 1)
+        prefix = base_channel + "・"
+        if name.startswith(prefix):
+            suffix = name[len(prefix):]
+            if suffix.isdigit():
+                return (server_index, int(suffix))
+    return (len(BASE_DIRECTIONS), channel.position)
+
+
+async def reorder_work_channels(category):
+    known_names = set(WORK_CHANNELS.values())
+    children = list(category.channels)
+    known = [c for c in children if isinstance(c, discord.TextChannel) and c.name in known_names]
+    other = [c for c in children if c not in known]
+    ordered = sorted(known, key=division_channel_sort_key) + sorted(other, key=lambda c: c.position)
+    for position, channel in enumerate(ordered):
+        if channel.position != position:
+            await channel.edit(position=position, reason="Karma: автоматическая сортировка рабочих каналов")
+
+
 @bot.tree.command(name="create_division", description="Создать новое подразделение и его Discord-ресурсы")
 @app_commands.guild_only()
 @app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def create_division(interaction: discord.Interaction, server: app_commands.Choice[str]):
     if not is_owner(interaction.user):
-        await interaction.response.send_message("Создавать подразделения могут только участники с ролью «Владелец».", ephemeral=True); return
+        await interaction.response.send_message("Создавать подразделения могут только участники с ролью «Владелец».", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     base = server.value
     guild = interaction.guild
+    work_category = discord.utils.get(guild.categories, name=WORK_CATEGORY_NAME)
+    if work_category is None:
+        await interaction.followup.send(f"Не найдена категория **{WORK_CATEGORY_NAME}**. Проверь её название.", ephemeral=True)
+        return
+    base_role = discord.utils.get(guild.roles, name=base)
+    base_channel = discord.utils.get(guild.text_channels, name=BASE_WORK_CHANNELS[base])
+    if base_role is None or base_channel is None:
+        await interaction.followup.send(f"Не найдены базовая роль **{base}** или канал **{BASE_WORK_CHANNELS[base]}**.", ephemeral=True)
+        return
+
     with database() as db:
         rows = db.execute("SELECT name,division_number,role_name,channel_name FROM divisions WHERE server_name=? ORDER BY division_number", (base,)).fetchall()
-        # If a previous attempt registered a division but Discord creation failed,
-        # resume that same division instead of skipping its number.
         pending = None
         for row in rows:
             existing_role = discord.utils.get(guild.roles, name=row["role_name"])
             existing_channel = discord.utils.get(guild.text_channels, name=row["channel_name"])
-            if existing_role is None or existing_channel is None:
+            if existing_role is None or existing_channel is None or existing_channel.category_id != work_category.id:
                 pending = row
                 break
         if pending:
@@ -2273,7 +2388,7 @@ async def create_division(interaction: discord.Interaction, server: app_commands
             role_name = name
             db.execute("INSERT INTO divisions(name,server_name,role_name,channel_name,division_number,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
                        (name, base, role_name, channel_name, number, now_iso(), str(interaction.user.id)))
-    # Make the new division available to report handling immediately.
+
     if name not in DIRECTIONS:
         DIRECTIONS.append(name)
     SERVER_CODES[name] = SERVER_CODES[base]
@@ -2282,26 +2397,60 @@ async def create_division(interaction: discord.Interaction, server: app_commands
     channel = discord.utils.get(guild.text_channels, name=channel_name)
     try:
         if role is None:
-            role = await guild.create_role(name=role_name, mentionable=False, reason=f"Karma: создание подразделения {name}")
+            role = await guild.create_role(
+                name=role_name, permissions=base_role.permissions, colour=base_role.colour,
+                hoist=base_role.hoist, mentionable=base_role.mentionable,
+                reason=f"Karma: создание подразделения {name}"
+            )
+            try:
+                await role.edit(position=base_role.position, reason="Karma: сортировка ролей подразделений")
+            except discord.HTTPException:
+                pass
+
+        # Category permissions + base channel overrides; replace the base division role.
+        overwrites = dict(work_category.overwrites)
+        overwrites.update(base_channel.overwrites)
+        base_role_overwrite = overwrites.pop(base_role, None)
+        overwrites[role] = base_role_overwrite or discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True
+        )
+        overwrites[guild.default_role] = overwrites.get(guild.default_role, discord.PermissionOverwrite(view_channel=False))
+        bot_member = guild.get_member(bot.user.id) if bot.user else None
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_messages=True, manage_channels=True, attach_files=True, embed_links=True
+            )
         if channel is None:
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
-            }
-            bot_member = guild.get_member(bot.user.id) if bot.user else None
-            if bot_member:
-                overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True, manage_channels=True)
-            for privileged_name in ADMIN_ROLE_NAMES:
-                privileged_role = discord.utils.get(guild.roles, name=privileged_name)
-                if privileged_role:
-                    overwrites[privileged_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-            channel = await guild.create_text_channel(channel_name, overwrites=overwrites, reason=f"Karma: создание подразделения {name}")
+            channel = await guild.create_text_channel(
+                channel_name, category=work_category, overwrites=overwrites,
+                topic=f"KARMA NOIRE • {name} • рабочие отчёты",
+                reason=f"Karma: создание подразделения {name}"
+            )
+        else:
+            await channel.edit(category=work_category, overwrites=overwrites,
+                               reason=f"Karma: размещение подразделения {name} в рабочей категории")
         await ensure_report_panel(channel, name)
+        await reorder_work_channels(work_category)
     except discord.Forbidden:
-        await interaction.followup.send("Не хватило прав. Выдай Karma разрешения Manage Roles и Manage Channels; роль бота должна быть выше создаваемых ролей. Подразделение записано в базе, повторный запуск команды поможет завершить создание.", ephemeral=True); return
+        await interaction.followup.send(
+            "Не хватило прав. Karma нужны Manage Roles и Manage Channels, а её роль должна быть выше роли основного подразделения. Запись сохранена — повторный запуск продолжит создание.",
+            ephemeral=True
+        )
+        return
     except discord.HTTPException as error:
-        await interaction.followup.send(f"Discord не смог создать ресурсы: {error}. Запись подразделения сохранена; повторный запуск попробует завершить создание.", ephemeral=True); return
-    await interaction.followup.send(f"Подразделение **{name}** готово.\nРоль: {role.mention}\nКанал: {channel.mention}\nИгровой сервер: **{SERVER_CODES[base]} • {base}**", ephemeral=True)
+        await interaction.followup.send(
+            f"Discord не завершил создание подразделения: {error}. Запись сохранена — повторный запуск продолжит с недостающего шага.",
+            ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"**KARMA NOIRE • ПОДРАЗДЕЛЕНИЕ СОЗДАНО**\n\n"
+        f"Игровой сервер: **{SERVER_CODES[base]} • {base}**\n"
+        f"Подразделение: **{name}**\nРоль: {role.mention}\nКанал: {channel.mention}\n\n"
+        "Канал размещён в категории `03・РАБОТА` и отсортирован автоматически.",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="set_rate", description="Установить индивидуальную стоимость балла сотрудника")
