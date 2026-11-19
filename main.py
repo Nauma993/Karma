@@ -215,6 +215,9 @@ def init_database():
                 FOREIGN KEY(employee_id) REFERENCES employees(id)
             )
         """)
+        # Safe migration: point adjustments store the rate that applied when
+        # the adjustment was made. Existing rows receive the historical default.
+        add_column("point_adjustments", "point_rate", "INTEGER NOT NULL DEFAULT 20000000")
         db.execute("""
             CREATE TABLE IF NOT EXISTS report_sessions (
                 guild_id TEXT NOT NULL,
