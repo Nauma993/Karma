@@ -19,7 +19,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = "/app/data/karma.db"
 
 DIRECTIONS = ["Mesa №2","Mesa", "Surprise", "Prescott", "Faraway"]
-SERVER_CODES = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
+SERVER_CODES = {"Mesa №2": "07","Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
 MAX_EMPLOYEE_BUSINESSES = 100
 
 REVIEW_CHANNEL_NAME = "проверка-отчётов"
