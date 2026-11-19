@@ -18,7 +18,7 @@ from discord.ext import tasks
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = "/app/data/karma.db"
 
-DIRECTIONS = ["Mesa", "Surprise", "Prescott", "Faraway"]
+DIRECTIONS = ["Mesa №2","Mesa", "Surprise", "Prescott", "Faraway"]
 SERVER_CODES = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
 MAX_EMPLOYEE_BUSINESSES = 100
 
