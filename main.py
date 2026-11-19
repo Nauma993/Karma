@@ -18,8 +18,15 @@ from discord.ext import tasks
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = "/app/data/karma.db"
 
-DIRECTIONS = ["Mesa №2","Mesa", "Surprise", "Prescott", "Faraway"]
-SERVER_CODES = {"Mesa №2": "07","Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
+DIRECTIONS = ["Mesa", "Surprise", "Prescott", "Faraway"]
+SERVER_CODES = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
+BASE_DIRECTIONS = list(DIRECTIONS)
+BASE_WORK_CHANNELS = {
+    "Mesa": "mesa・работа",
+    "Surprise": "surprise・работа",
+    "Prescott": "prescott・работа",
+    "Faraway": "faraway・работа",
+}
 MAX_EMPLOYEE_BUSINESSES = 100
 
 REVIEW_CHANNEL_NAME = "проверка-отчётов"
@@ -33,13 +40,7 @@ ADMIN_ROLE_NAMES = ("Владелец", "Администратор")
 OWNER_ROLE_NAME = "Владелец"
 RECRUIT_ROLE_NAME = "Новобранец"
 
-WORK_CHANNELS = {
-    "Mesa": "mesa・работа",
-    "Mesa №2": "mesa・работа・2",
-    "Surprise": "surprise・работа",
-    "Prescott": "prescott・работа",
-    "Faraway": "faraway・работа",
-}
+WORK_CHANNELS = dict(BASE_WORK_CHANNELS)
 
 SERVER_TZ = ZoneInfo("Europe/Moscow")
 POINT_VALUE = 20_000_000
@@ -143,6 +144,66 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_business_employee
             ON businesses(employee_id, status)
         """)
+        add_column("businesses", "owner_id", "TEXT")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS divisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                server_name TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                channel_name TEXT NOT NULL,
+                division_number INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                created_by TEXT
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_divisions_server ON divisions(server_name, division_number)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_name TEXT NOT NULL,
+                organization_name TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                UNIQUE(server_name, organization_name)
+            )
+        """)
+
+        # Existing employee-linked businesses are migrated to a named owner.
+        # Use the employee record's explicitly assigned responsible owner.
+        # If none exists, leave ownership blank rather than guessing.
+        db.execute("""
+            UPDATE businesses
+            SET owner_id = (SELECT NULLIF(e.owner_id, '') FROM employees e WHERE e.id=businesses.employee_id)
+            WHERE owner_id IS NULL AND employee_id IS NOT NULL
+        """)
+        # Old code stored Mesa №2 as a separate server. Keep it as a division,
+        # while consolidating its business assets under the real game server Mesa.
+        db.execute("""
+            INSERT OR IGNORE INTO divisions(name,server_name,role_name,channel_name,division_number,created_at)
+            SELECT 'Mesa №2','Mesa','Mesa №2','mesa・работа・2',2,?
+            WHERE EXISTS (SELECT 1 FROM employees WHERE direction='Mesa №2')
+               OR EXISTS (SELECT 1 FROM businesses WHERE server_name='Mesa №2')
+        """, (now_iso(),))
+        db.execute("""
+            UPDATE businesses SET status='removed'
+            WHERE server_name='Mesa №2' AND status='active'
+              AND EXISTS (
+                SELECT 1 FROM businesses current
+                WHERE current.server_name='Mesa'
+                  AND current.business_id=businesses.business_id
+                  AND current.status='active'
+              )
+        """)
+        db.execute("UPDATE businesses SET server_name='Mesa' WHERE server_name='Mesa №2'")
+        db.execute("""
+            UPDATE servers SET business_count=business_count + COALESCE(
+                (SELECT business_count FROM servers old WHERE old.name='Mesa №2'), 0
+            ) WHERE name='Mesa' AND EXISTS (SELECT 1 FROM servers WHERE name='Mesa №2')
+        """)
+        db.execute("DELETE FROM servers WHERE name='Mesa №2'")
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS payments (
@@ -251,13 +312,33 @@ def init_database():
                 reviewer_id TEXT
             )
         """)
-        server_codes = {"Mesa": "07", "Mesa №2": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
+        server_codes = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
         for name, code in server_codes.items():
             db.execute("INSERT OR IGNORE INTO servers(name, server_code) VALUES (?,?)", (name, code))
             db.execute("UPDATE servers SET server_code=COALESCE(server_code, ?) WHERE name=?", (code, name))
 
         # Legacy employees receive a default rate. Their owner can be assigned later.
         db.execute("UPDATE employees SET point_rate=? WHERE point_rate IS NULL OR point_rate<=0", (POINT_VALUE,))
+        division_rows = db.execute("SELECT name,server_name,channel_name FROM divisions ORDER BY server_name,division_number").fetchall()
+        # Also preserve any legacy employee directions as divisions.
+        legacy_rows = db.execute("SELECT DISTINCT direction FROM employees WHERE direction NOT IN ('Mesa','Surprise','Prescott','Faraway')").fetchall()
+        for legacy in legacy_rows:
+            name = legacy["direction"]
+            if name.endswith(" №2") and name[:-3] in server_codes:
+                base = name[:-3]
+                channel = f"{BASE_WORK_CHANNELS[base]}・2"
+                db.execute("INSERT OR IGNORE INTO divisions(name,server_name,role_name,channel_name,division_number,created_at) VALUES(?,?,?,?,2,?)",
+                           (name,base,name,channel,now_iso()))
+        division_rows = db.execute("SELECT name,server_name,channel_name FROM divisions ORDER BY server_name,division_number").fetchall()
+    DIRECTIONS[:] = list(BASE_DIRECTIONS)
+    SERVER_CODES.clear()
+    SERVER_CODES.update({"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"})
+    WORK_CHANNELS.clear()
+    WORK_CHANNELS.update(BASE_WORK_CHANNELS)
+    for division in division_rows:
+        DIRECTIONS.append(division["name"])
+        SERVER_CODES[division["name"]] = SERVER_CODES.get(division["server_name"], "—")
+        WORK_CHANNELS[division["name"]] = division["channel_name"]
     print("Karma database initialized (safe migration completed)!")
 
 
@@ -1017,13 +1098,29 @@ async def daily_reminder():
     with database() as db:
         employees = db.execute(
             """
-            SELECT id, discord_id, direction
+            SELECT id, discord_id, direction, guild_id
             FROM employees
             WHERE status = 'active'
             """
         ).fetchall()
 
         for employee in employees:
+            # Owners and administrators are not expected to submit staff reports.
+            member = None
+            for guild in bot.guilds:
+                if employee["guild_id"] and str(guild.id) != str(employee["guild_id"]):
+                    continue
+                member = guild.get_member(int(employee["discord_id"]))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(int(employee["discord_id"]))
+                    except (discord.HTTPException, ValueError):
+                        member = None
+                if member:
+                    break
+            if member and is_manager(member):
+                continue
+
             submitted = db.execute(
                 """
                 SELECT id FROM submissions
@@ -1182,10 +1279,19 @@ async def ping(interaction: discord.Interaction):
 # ============================================================
 
 
-@bot.tree.command(name="invite", description="Принять сотрудника на игровой сервер")
+async def division_autocomplete(interaction: discord.Interaction, current: str):
+    with database() as db:
+        rows = db.execute("SELECT name,server_name FROM divisions ORDER BY server_name,division_number").fetchall()
+    options = [(name, SERVER_CODES[name]) for name in BASE_DIRECTIONS]
+    options.extend((row["name"], SERVER_CODES.get(row["server_name"], "—")) for row in rows)
+    return [app_commands.Choice(name=f"{code} • {name}", value=name)
+            for name, code in options if current.casefold() in name.casefold()][:25]
+
+
+@bot.tree.command(name="invite", description="Принять сотрудника в подразделение")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
-async def invite(interaction: discord.Interaction, member: discord.Member, server: app_commands.Choice[str]):
+@app_commands.autocomplete(server=division_autocomplete)
+async def invite(interaction: discord.Interaction, member: discord.Member, server: str):
     if not is_manager(interaction.user):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True); return
     if member.bot:
@@ -1197,11 +1303,11 @@ async def invite(interaction: discord.Interaction, member: discord.Member, serve
         cur = db.execute("""
             INSERT INTO employees(discord_id,direction,joined_at,status,owner_id,point_rate,guild_id)
             VALUES(?,?,?,'active',?,?,?)
-        """, (str(member.id), server.value, now_iso(), str(interaction.user.id), POINT_VALUE, str(interaction.guild_id)))
+        """, (str(member.id), server, now_iso(), str(interaction.user.id), POINT_VALUE, str(interaction.guild_id)))
         employee_id = cur.lastrowid
         db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('INVITE',?,?)",
-                   (f"employee={member.id}; server={server.value}; owner={interaction.user.id}", now_iso()))
-    role = discord.utils.get(interaction.guild.roles, name=server.value)
+                   (f"employee={member.id}; server={server}; owner={interaction.user.id}", now_iso()))
+    role = discord.utils.get(interaction.guild.roles, name=server)
     if role:
         try:
             await member.add_roles(role, reason="Принят на работу через Karma")
@@ -1212,7 +1318,7 @@ async def invite(interaction: discord.Interaction, member: discord.Member, serve
             await interaction.response.send_message("Не удалось выдать роль. Запись о сотруднике отменена; проверь иерархию ролей.", ephemeral=True)
             return
     await interaction.response.send_message(
-        f"{member.mention} принят на **{SERVER_CODES[server.value]} • {server.value}**.\n"
+        f"{member.mention} принят в **{SERVER_CODES.get(server, '—')} • {server}**.\n"
         f"Ответственный владелец: {interaction.user.mention}\nID сотрудника: `{employee_id}`",
         ephemeral=True
     )
@@ -1349,7 +1455,6 @@ async def render_employee_stats(interaction: discord.Interaction, target: discor
         approved = db.execute("SELECT COUNT(*) FROM submissions WHERE employee_id=? AND status='approved'", (employee["id"],)).fetchone()[0]
         rejected = db.execute("SELECT COUNT(*) FROM submissions WHERE employee_id=? AND status='rejected'", (employee["id"],)).fetchone()[0]
         pending = db.execute("SELECT COUNT(*) FROM submissions WHERE employee_id=? AND status='pending'", (employee["id"],)).fetchone()[0]
-        biz = db.execute("SELECT business_id FROM businesses WHERE employee_id=? AND status='active' ORDER BY business_id", (employee["id"],)).fetchall()
         daily = db.execute("SELECT work_date,SUM(points) points FROM daily_entries WHERE employee_id=? GROUP BY work_date ORDER BY work_date DESC LIMIT 7", (employee["id"],)).fetchall()
     embed = make_embed("KARMA NOIRE | СТАТИСТИКА", f"Сотрудник: {target.mention}")
     embed.add_field(name="SERVER", value=f"{employee['direction']} • №{SERVER_CODES.get(employee['direction'],'—')}", inline=True)
@@ -1359,7 +1464,6 @@ async def render_employee_stats(interaction: discord.Interaction, target: discor
     embed.add_field(name="ОПЛАЧЕНО", value=f"{paid} баллов", inline=True)
     embed.add_field(name="К ВЫПЛАТЕ", value=f"{unpaid} баллов\n{money(unpaid_amount)}", inline=True)
     embed.add_field(name="ОТЧЁТЫ", value=f"Принято: {approved}\nОтклонено: {rejected}\nОжидает: {pending}", inline=True)
-    embed.add_field(name="ЗАКРЕПЛЁННЫЕ БИЗНЕСЫ", value=", ".join(f"`{r['business_id']}`" for r in biz) or "Пока нет", inline=False)
     if daily:
         embed.add_field(name="ПОСЛЕДНИЕ РАБОЧИЕ ДНИ", value="\n".join(f"`{r['work_date']}` — **{r['points']}** баллов" for r in daily), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1648,16 +1752,24 @@ async def servers(interaction: discord.Interaction):
     if not is_manager(interaction.user):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True); return
     with database() as db:
+        divisions = db.execute("SELECT name,server_name,division_number FROM divisions ORDER BY server_name,division_number").fetchall()
         result = []
-        for name in DIRECTIONS:
-            staff = db.execute("SELECT discord_id FROM employees WHERE direction=? AND status='active' ORDER BY id", (name,)).fetchall()
+        for name in BASE_DIRECTIONS:
+            division_names = [row["name"] for row in divisions if row["server_name"] == name]
+            names = [name] + division_names
+            placeholders = ",".join("?" for _ in names)
+            staff = db.execute(f"SELECT discord_id,direction FROM employees WHERE direction IN ({placeholders}) AND status='active' ORDER BY direction,id", names).fetchall()
             biz_count = db.execute("SELECT COUNT(*) FROM businesses WHERE server_name=? AND status='active'", (name,)).fetchone()[0]
-            result.append((name, staff, biz_count))
-    embed = make_embed("KARMA NOIRE | SERVERS")
-    for name, staff, biz_count in result:
+            result.append((name, division_names, staff, biz_count))
+    embed = make_embed("KARMA NOIRE | SERVERS", "Общая статистика игровых серверов и их подразделений")
+    for name, division_names, staff, biz_count in result:
         staff_text = ", ".join(f"<@{r['discord_id']}>" for r in staff) or "Нет сотрудников"
-        embed.add_field(name=f"{SERVER_CODES[name]} • {name}",
-                        value=f"Сотрудников: **{len(staff)}**\nБизнесов: **{biz_count}**\n{staff_text}"[:1024], inline=False)
+        embed.add_field(name=f"{SERVER_CODES[name]} • {name} — ВСЕГО",
+                        value=f"Подразделений: **{1 + len(division_names)}**\nСотрудников: **{len(staff)}**\nБизнесов: **{biz_count}**\n{staff_text}"[:1024], inline=False)
+        for division in [name] + division_names:
+            division_staff = [r for r in staff if r["direction"] == division]
+            division_text = ", ".join(f"<@{r['discord_id']}>" for r in division_staff) or "Нет сотрудников"
+            embed.add_field(name=f"↳ {division}", value=f"Сотрудников: **{len(division_staff)}**\n{division_text}"[:1024], inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1967,142 +2079,229 @@ async def set_employee_owner(interaction: discord.Interaction, member: discord.M
 # BUSINESS REGISTER AND EMPLOYEE ASSIGNMENTS
 # ============================================================
 
-@bot.tree.command(name="add_biz", description="Добавить бизнес в общий реестр и закрепить за сотрудником")
+@bot.tree.command(name="add_biz", description="Добавить бизнес и указать его владельца")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def add_biz(interaction: discord.Interaction, server: app_commands.Choice[str],
                   owner: discord.Member, business_id: app_commands.Range[int, 1, 999999999]):
     if not is_owner(interaction.user):
-        await interaction.response.send_message("Команда доступна только владельцам.", ephemeral=True); return
-    with database() as db:
-        employee = get_employee_by_discord_id(db, owner.id)
-        if not employee:
-            await interaction.response.send_message("Указанный участник не числится активным сотрудником.", ephemeral=True); return
-        if employee["direction"] != server.value:
-            await interaction.response.send_message(f"Сотрудник закреплён за {employee['direction']}, а бизнес относится к {server.value}.", ephemeral=True); return
-        count = db.execute("SELECT COUNT(*) FROM businesses WHERE employee_id=? AND status='active'", (employee["id"],)).fetchone()[0]
-        if count >= MAX_EMPLOYEE_BUSINESSES:
-            await interaction.response.send_message(f"У сотрудника уже максимально допустимые {MAX_EMPLOYEE_BUSINESSES} бизнесов.", ephemeral=True); return
-        try:
-            db.execute("INSERT INTO businesses(business_id,server_name,employee_id,added_by,created_at,status) VALUES(?,?,?,?,?,'active')",
-                       (str(business_id), server.value, employee["id"], str(interaction.user.id), now_iso()))
-        except sqlite3.IntegrityError:
-            await interaction.response.send_message("Бизнес с таким ID уже есть в общем реестре.", ephemeral=True); return
-        db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_ADDED',?,?)",
-                   (f"biz={business_id}; server={server.value}; employee={owner.id}; actor={interaction.user.id}", now_iso()))
+        await interaction.response.send_message("Добавлять бизнесы могут только участники с ролью «Владелец».", ephemeral=True); return
+    try:
+        with database() as db:
+            db.execute("INSERT INTO businesses(business_id,server_name,employee_id,added_by,created_at,status,owner_id) VALUES(?,?,NULL,?,?,'active',?)",
+                       (str(business_id), server.value, str(interaction.user.id), now_iso(), str(owner.id)))
+            db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_ADDED',?,?)",
+                       (f"biz={business_id}; server={server.value}; owner={owner.id}; actor={interaction.user.id}", now_iso()))
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("Бизнес с таким ID уже есть в реестре этого игрового сервера.", ephemeral=True); return
     await interaction.response.send_message(
-        f"Бизнес **{business_id}** добавлен в реестр и закреплён за {owner.mention}.\n"
-        f"Сервер: **{SERVER_CODES[server.value]} • {server.value}**.", ephemeral=True)
+        f"Бизнес **{business_id}** добавлен.\nИгровой сервер: **{SERVER_CODES[server.value]} • {server.value}**\nВладелец: {owner.mention}", ephemeral=True)
 
 
 @bot.tree.command(name="remove_biz", description="Убрать бизнес из общего реестра")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def remove_biz(interaction: discord.Interaction, server: app_commands.Choice[str],
                      business_id: app_commands.Range[int, 1, 999999999]):
     if not is_owner(interaction.user):
         await interaction.response.send_message("Команда доступна только владельцам.", ephemeral=True); return
     with database() as db:
-        row = db.execute("SELECT * FROM businesses WHERE business_id=? AND server_name=? AND status='active'", (str(business_id), server.value)).fetchone()
-        if not row:
+        cur = db.execute("UPDATE businesses SET status='removed' WHERE business_id=? AND server_name=? AND status='active'",
+                         (str(business_id), server.value))
+        if cur.rowcount == 0:
             await interaction.response.send_message("Активный бизнес с таким ID не найден.", ephemeral=True); return
-        db.execute("UPDATE businesses SET status='removed',employee_id=NULL WHERE business_id=? AND server_name=?", (str(business_id), server.value))
         db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_REMOVED',?,?)",
                    (f"biz={business_id}; server={server.value}; actor={interaction.user.id}", now_iso()))
     await interaction.response.send_message(f"Бизнес **{business_id}** удалён из активного реестра. История сохранена.", ephemeral=True)
 
 
-@bot.tree.command(name="assign_biz", description="Переназначить бизнес другому сотруднику")
+@bot.tree.command(name="assign_biz", description="Изменить владельца зарегистрированного бизнеса")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def assign_biz(interaction: discord.Interaction, server: app_commands.Choice[str],
-                     business_id: app_commands.Range[int, 1, 999999999], employee_member: discord.Member):
+                     business_id: app_commands.Range[int, 1, 999999999], owner: discord.Member):
     if not is_owner(interaction.user):
         await interaction.response.send_message("Команда доступна только владельцам.", ephemeral=True); return
     with database() as db:
-        biz = db.execute("SELECT * FROM businesses WHERE business_id=? AND server_name=? AND status='active'", (str(business_id), server.value)).fetchone()
-        employee = get_employee_by_discord_id(db, employee_member.id)
-        if not biz or not employee:
-            await interaction.response.send_message("Бизнес или активный сотрудник не найден.", ephemeral=True); return
-        if employee["direction"] != biz["server_name"]:
-            await interaction.response.send_message("Нельзя закрепить бизнес за сотрудником другого игрового сервера.", ephemeral=True); return
-        count = db.execute("SELECT COUNT(*) FROM businesses WHERE employee_id=? AND status='active'", (employee["id"],)).fetchone()[0]
-        already = biz["employee_id"] == employee["id"]
-        if not already and count >= MAX_EMPLOYEE_BUSINESSES:
-            await interaction.response.send_message(f"У сотрудника уже {MAX_EMPLOYEE_BUSINESSES} бизнесов.", ephemeral=True); return
-        db.execute("UPDATE businesses SET employee_id=?,added_by=? WHERE business_id=?",
-                   (employee["id"], str(interaction.user.id), str(business_id)))
-        db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_ASSIGNED',?,?)",
-                   (f"biz={business_id}; employee={employee_member.id}; actor={interaction.user.id}", now_iso()))
-    await interaction.response.send_message(f"Бизнес **{business_id}** закреплён за {employee_member.mention}.", ephemeral=True)
+        cur = db.execute("UPDATE businesses SET owner_id=?,employee_id=NULL,added_by=? WHERE business_id=? AND server_name=? AND status='active'",
+                         (str(owner.id), str(interaction.user.id), str(business_id), server.value))
+        if cur.rowcount == 0:
+            await interaction.response.send_message("Активный бизнес не найден.", ephemeral=True); return
+        db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_OWNER_CHANGED',?,?)",
+                   (f"biz={business_id}; server={server.value}; owner={owner.id}; actor={interaction.user.id}", now_iso()))
+    await interaction.response.send_message(f"Владелец бизнеса **{business_id}** изменён: {owner.mention}.", ephemeral=True)
 
 
-@bot.tree.command(name="unassign_biz", description="Освободить бизнес от закреплённого сотрудника")
+@bot.tree.command(name="unassign_biz", description="Снять владельца с бизнеса")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def unassign_biz(interaction: discord.Interaction, server: app_commands.Choice[str],
                        business_id: app_commands.Range[int, 1, 999999999]):
     if not is_owner(interaction.user):
         await interaction.response.send_message("Команда доступна только владельцам.", ephemeral=True); return
     with database() as db:
-        cur = db.execute("UPDATE businesses SET employee_id=NULL,added_by=? WHERE business_id=? AND server_name=? AND status='active'",
+        cur = db.execute("UPDATE businesses SET owner_id=NULL,added_by=? WHERE business_id=? AND server_name=? AND status='active'",
                          (str(interaction.user.id), str(business_id), server.value))
         if cur.rowcount == 0:
             await interaction.response.send_message("Активный бизнес не найден.", ephemeral=True); return
-        db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_UNASSIGNED',?,?)",
-                   (f"biz={business_id}; actor={interaction.user.id}", now_iso()))
-    await interaction.response.send_message(f"Бизнес **{business_id}** освобождён. Он остаётся в общем реестре.", ephemeral=True)
+        db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('BIZ_OWNER_CLEARED',?,?)",
+                   (f"biz={business_id}; server={server.value}; actor={interaction.user.id}", now_iso()))
+    await interaction.response.send_message(f"Владелец бизнеса **{business_id}** снят. Бизнес остался в реестре.", ephemeral=True)
 
 
-@bot.tree.command(name="bizinfo", description="Показать общий реестр бизнесов")
+@bot.tree.command(name="bizinfo", description="Показать общий реестр бизнесов по владельцам")
 @app_commands.guild_only()
-@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in DIRECTIONS])
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
 async def bizinfo(interaction: discord.Interaction, server: app_commands.Choice[str] = None,
                   owner: discord.Member = None):
     if not is_manager(interaction.user):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True); return
-    query = """
-        SELECT b.business_id,b.server_name,b.employee_id,e.discord_id
-        FROM businesses b LEFT JOIN employees e ON e.id=b.employee_id
-        WHERE b.status='active'
-    """
+    query = "SELECT business_id,server_name,owner_id FROM businesses WHERE status='active'"
     params = []
     if server:
-        query += " AND b.server_name=?"; params.append(server.value)
+        query += " AND server_name=?"; params.append(server.value)
     if owner:
-        query += " AND e.discord_id=?"; params.append(str(owner.id))
-    query += " ORDER BY b.server_name,CAST(b.business_id AS INTEGER)"
+        query += " AND owner_id=?"; params.append(str(owner.id))
     with database() as db:
         rows = db.execute(query, params).fetchall()
+        org_query = "SELECT server_name,organization_name,owner_id FROM organizations WHERE status='active'"
+        org_params = []
+        if server:
+            org_query += " AND server_name=?"; org_params.append(server.value)
+        if owner:
+            org_query += " AND owner_id=?"; org_params.append(str(owner.id))
+        orgs = db.execute(org_query, org_params).fetchall()
+    owner_names = {}
+    owner_ids = {str(r["owner_id"]) for r in rows + orgs if r["owner_id"]}
+    for owner_id in owner_ids:
+        member = interaction.guild.get_member(int(owner_id)) if interaction.guild else None
+        if member is None:
+            try:
+                member = await bot.fetch_user(int(owner_id))
+            except (discord.HTTPException, ValueError):
+                member = None
+        owner_names[owner_id] = (member.display_name if isinstance(member, discord.Member) else member.name).casefold() if member else f"~{owner_id}"
+    def owner_sort_key(uid):
+        return (owner_names.get(str(uid), "~"), str(uid or ""))
+    rows = sorted(rows, key=lambda r: (r["server_name"], owner_sort_key(r["owner_id"]), int(r["business_id"]) if str(r["business_id"]).isdigit() else str(r["business_id"])))
+    orgs = sorted(orgs, key=lambda r: (r["server_name"], owner_sort_key(r["owner_id"]), r["organization_name"].casefold()))
     embed = make_embed("KARMA NOIRE | BIZINFO", "ОБЩИЙ РЕЕСТР АКТИВОВ")
-    if not rows:
-        embed.description = "По заданным параметрам активных бизнесов нет."
-    else:
+    if orgs:
+        embed.add_field(name="ЧАСТНЫЕ ОРГАНИЗАЦИИ", value="\u200b", inline=False)
+        grouped_orgs = {}
+        for row in orgs:
+            grouped_orgs.setdefault(row["server_name"], []).append(f"**{row['organization_name']}** — <@{row['owner_id']}>")
+        for name, lines in grouped_orgs.items():
+            for offset in range(0, len(lines), 15):
+                embed.add_field(name=f"{SERVER_CODES.get(name,'—')} • {name}", value="\n".join(lines[offset:offset+15])[:1024], inline=False)
+    if rows:
+        embed.add_field(name="БИЗНЕСЫ", value="\u200b", inline=False)
         grouped = {}
         for row in rows:
-            grouped.setdefault(row["server_name"], []).append(
-                f"`{row['business_id']}` — <@{row['discord_id']}>" if row["discord_id"] else f"`{row['business_id']}` — не закреплён"
-            )
-        for name, values in grouped.items():
-            embed.add_field(name=f"{SERVER_CODES.get(name,'—')} • {name} ({len(values)})",
-                            value="\n".join(values)[:1024], inline=False)
-        embed.set_footer(text=f"Всего активных бизнесов: {len(rows)}")
+            grouped.setdefault(row["server_name"], []).append(f"`{row['business_id']}` — <@{row['owner_id']}>" if row["owner_id"] else f"`{row['business_id']}` — владелец не указан")
+        for name, lines in grouped.items():
+            for offset in range(0, len(lines), 15):
+                embed.add_field(name=f"{SERVER_CODES.get(name,'—')} • {name} ({len(lines)})", value="\n".join(lines[offset:offset+15])[:1024], inline=False)
+    if not rows and not orgs:
+        embed.description = "Активных организаций и бизнесов по заданным параметрам нет."
+    embed.set_footer(text=f"Всего организаций: {len(orgs)} • Всего активных бизнесов: {len(rows)}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="my_biz", description="Посмотреть закреплённые за собой бизнесы")
+@bot.tree.command(name="my_biz", description="Посмотреть бизнесы, владельцем которых ты являешься")
 @app_commands.guild_only()
 async def my_biz(interaction: discord.Interaction):
     with database() as db:
-        employee = get_employee_by_discord_id(db, interaction.user.id)
-        if not employee:
-            await interaction.response.send_message("Ты не числишься активным сотрудником.", ephemeral=True); return
-        rows = db.execute("SELECT business_id FROM businesses WHERE employee_id=? AND status='active' ORDER BY CAST(business_id AS INTEGER)",
-                          (employee["id"],)).fetchall()
-    await interaction.response.send_message(
-        f"**Твои бизнесы — {SERVER_CODES.get(employee['direction'],'—')} • {employee['direction']}**\n" +
-        (", ".join(f"`{r['business_id']}`" for r in rows) if rows else "Пока нет закреплённых бизнесов.") +
-        f"\n\nКоличество: **{len(rows)}/{MAX_EMPLOYEE_BUSINESSES}**", ephemeral=True)
+        rows = db.execute("SELECT business_id,server_name FROM businesses WHERE owner_id=? AND status='active' ORDER BY server_name,CAST(business_id AS INTEGER)", (str(interaction.user.id),)).fetchall()
+    if not rows:
+        await interaction.response.send_message("За тобой не зарегистрировано активных бизнесов.", ephemeral=True); return
+    lines = [f"**{SERVER_CODES.get(r['server_name'],'—')} • {r['server_name']}** — `{r['business_id']}`" for r in rows]
+    await interaction.response.send_message("**Твои бизнесы:**\n" + "\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="add_org", description="Добавить частную организацию в реестр активов")
+@app_commands.guild_only()
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
+async def add_org(interaction: discord.Interaction, server: app_commands.Choice[str],
+                  organization_name: app_commands.Range[str, 2, 80], owner: discord.Member):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("Добавлять организации могут только участники с ролью «Владелец».", ephemeral=True); return
+    name = organization_name.strip()
+    if not name:
+        await interaction.response.send_message("Название организации не может быть пустым.", ephemeral=True); return
+    try:
+        with database() as db:
+            db.execute("INSERT INTO organizations(server_name,organization_name,owner_id,added_by,created_at,status) VALUES(?,?,?,?,?,'active')",
+                       (server.value, name, str(owner.id), str(interaction.user.id), now_iso()))
+            db.execute("INSERT INTO audit_log(action,details,created_at) VALUES('ORG_ADDED',?,?)",
+                       (f"organization={name}; server={server.value}; owner={owner.id}; actor={interaction.user.id}", now_iso()))
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("Организация с таким названием уже зарегистрирована на этом сервере.", ephemeral=True); return
+    await interaction.response.send_message(f"Организация **{name}** добавлена.\nСервер: **{SERVER_CODES[server.value]} • {server.value}**\nВладелец: {owner.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="create_division", description="Создать новое подразделение и его Discord-ресурсы")
+@app_commands.guild_only()
+@app_commands.choices(server=[app_commands.Choice(name=f"{SERVER_CODES[n]} • {n}", value=n) for n in BASE_DIRECTIONS])
+async def create_division(interaction: discord.Interaction, server: app_commands.Choice[str]):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("Создавать подразделения могут только участники с ролью «Владелец».", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    base = server.value
+    guild = interaction.guild
+    with database() as db:
+        rows = db.execute("SELECT name,division_number,role_name,channel_name FROM divisions WHERE server_name=? ORDER BY division_number", (base,)).fetchall()
+        # If a previous attempt registered a division but Discord creation failed,
+        # resume that same division instead of skipping its number.
+        pending = None
+        for row in rows:
+            existing_role = discord.utils.get(guild.roles, name=row["role_name"])
+            existing_channel = discord.utils.get(guild.text_channels, name=row["channel_name"])
+            if existing_role is None or existing_channel is None:
+                pending = row
+                break
+        if pending:
+            name = pending["name"]
+            number = int(pending["division_number"])
+            channel_name = pending["channel_name"]
+            role_name = pending["role_name"]
+        else:
+            used = {int(r["division_number"]) for r in rows}
+            number = max([1, *used]) + 1
+            name = f"{base} №{number}"
+            channel_name = f"{BASE_WORK_CHANNELS[base]}・{number}"
+            role_name = name
+            db.execute("INSERT INTO divisions(name,server_name,role_name,channel_name,division_number,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
+                       (name, base, role_name, channel_name, number, now_iso(), str(interaction.user.id)))
+    # Make the new division available to report handling immediately.
+    if name not in DIRECTIONS:
+        DIRECTIONS.append(name)
+    SERVER_CODES[name] = SERVER_CODES[base]
+    WORK_CHANNELS[name] = channel_name
+    role = discord.utils.get(guild.roles, name=role_name)
+    channel = discord.utils.get(guild.text_channels, name=channel_name)
+    try:
+        if role is None:
+            role = await guild.create_role(name=role_name, mentionable=False, reason=f"Karma: создание подразделения {name}")
+        if channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            }
+            bot_member = guild.get_member(bot.user.id) if bot.user else None
+            if bot_member:
+                overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True, manage_channels=True)
+            for privileged_name in ADMIN_ROLE_NAMES:
+                privileged_role = discord.utils.get(guild.roles, name=privileged_name)
+                if privileged_role:
+                    overwrites[privileged_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+            channel = await guild.create_text_channel(channel_name, overwrites=overwrites, reason=f"Karma: создание подразделения {name}")
+        await ensure_report_panel(channel, name)
+    except discord.Forbidden:
+        await interaction.followup.send("Не хватило прав. Выдай Karma разрешения Manage Roles и Manage Channels; роль бота должна быть выше создаваемых ролей. Подразделение записано в базе, повторный запуск команды поможет завершить создание.", ephemeral=True); return
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"Discord не смог создать ресурсы: {error}. Запись подразделения сохранена; повторный запуск попробует завершить создание.", ephemeral=True); return
+    await interaction.followup.send(f"Подразделение **{name}** готово.\nРоль: {role.mention}\nКанал: {channel.mention}\nИгровой сервер: **{SERVER_CODES[base]} • {base}**", ephemeral=True)
 
 
 @bot.tree.command(name="set_rate", description="Установить индивидуальную стоимость балла сотрудника")
@@ -2132,7 +2331,7 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(name="СОТРУДНИКИ", value="`/invite` — принять сотрудника.\n`/uninvite` — уволить и сохранить историю.\n`/employees` — список сотрудников.\n`/stats` — своя статистика.\n`/employee_stats` — статистика сотрудника.\n`/withdraw_report` — отозвать ожидающий отчёт.\n`/set_rate` — индивидуальная ставка.\n`/set_employee_owner` — закрепить сотрудника за владельцем.", inline=False)
         embed.add_field(name="ОТЧЁТЫ", value="`/setup_reports` — установить кнопки отчётов.\n`/stats` — личная статистика.\n`/employee_stats` — статистика сотрудника.\n`/logs` — журнал действий.", inline=False)
         embed.add_field(name="ФИНАНСЫ", value="`/payroll` — недельная ведомость.\n`/paid` — отметить фактическую выплату.\n`/servers` — обзор игровых серверов.", inline=False)
-        embed.add_field(name="БИЗНЕСЫ", value="`/add_biz` — добавить бизнес и закрепить.\n`/remove_biz` — убрать из реестра.\n`/assign_biz` — переназначить.\n`/unassign_biz` — освободить.\n`/bizinfo` — общий реестр.\n`/my_biz` — свои бизнесы.", inline=False)
+        embed.add_field(name="БИЗНЕСЫ", value="`/add_biz` — добавить бизнес и владельца.\n`/remove_biz` — убрать из реестра.\n`/assign_biz` — сменить владельца.\n`/unassign_biz` — снять владельца.\n`/add_org` — добавить организацию.\n`/create_division` — создать подразделение.\n`/bizinfo` — общий реестр активов.\n`/my_biz` — свои бизнесы.", inline=False)
         embed.add_field(name="ТИКЕТЫ", value="`/setup_tickets` — опубликовать панель заявок. Принять, отклонить и закрыть тикет можно кнопками внутри тикета.", inline=False)
     else:
         embed.add_field(name="СОТРУДНИК", value="`/help` — справка по доступным командам.\nВ рабочем канале нажми «Отправить отчёт» и приложи скриншот.", inline=False)
