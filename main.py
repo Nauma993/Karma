@@ -412,6 +412,7 @@ class KarmaBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.waiting_for_report = {}
+        self._guild_commands_synced = False
 
     async def setup_hook(self):
         init_database()
@@ -422,8 +423,9 @@ class KarmaBot(discord.Client):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
 
-        await self.tree.sync()
-        print("Karma commands synchronized!")
+        # Slash-команды будут синхронизированы с конкретными серверами Discord
+        # в on_ready: так они появляются на сервере сразу, не ожидая глобального
+        # распространения Discord.
 
         if not daily_reminder.is_running():
             daily_reminder.start()
@@ -432,6 +434,24 @@ class KarmaBot(discord.Client):
 
     async def on_ready(self):
         print(f"Karma is online as {self.user}")
+
+        if self._guild_commands_synced:
+            return
+
+        if not self.guilds:
+            print("WARNING: Karma is connected, but no Discord servers are available for command sync.")
+            return
+
+        for guild in self.guilds:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"Karma commands synchronized for {guild.name}: {len(synced)} commands")
+
+        # Удаляем старую глобальную регистрацию, чтобы не оставлять дубликаты.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+        print("Old global Karma commands cleared.")
+        self._guild_commands_synced = True
 
 
 bot = KarmaBot()
