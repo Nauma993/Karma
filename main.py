@@ -20,7 +20,7 @@ DB_PATH = "/app/data/karma.db"
 
 DIRECTIONS = ["Mesa", "Surprise", "Prescott", "Faraway"]
 SERVER_CODES = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
-MAX_EMPLOYEE_BUSINESSES = 8
+MAX_EMPLOYEE_BUSINESSES = 100
 
 REVIEW_CHANNEL_NAME = "проверка-отчётов"
 REJECTION_CHANNEL_NAME = "журнал-действий"
