@@ -35,6 +35,7 @@ RECRUIT_ROLE_NAME = "Новобранец"
 
 WORK_CHANNELS = {
     "Mesa": "mesa・работа",
+    "Mesa №2": "mesa・работа・2",
     "Surprise": "surprise・работа",
     "Prescott": "prescott・работа",
     "Faraway": "faraway・работа",
@@ -250,7 +251,7 @@ def init_database():
                 reviewer_id TEXT
             )
         """)
-        server_codes = {"Mesa": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
+        server_codes = {"Mesa": "07", "Mesa №2": "07", "Surprise": "10", "Prescott": "11", "Faraway": "26"}
         for name, code in server_codes.items():
             db.execute("INSERT OR IGNORE INTO servers(name, server_code) VALUES (?,?)", (name, code))
             db.execute("UPDATE servers SET server_code=COALESCE(server_code, ?) WHERE name=?", (code, name))
